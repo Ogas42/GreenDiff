@@ -1,0 +1,359 @@
+﻿project:
+  name: GreenDiff
+  seed: 42
+  device: cuda
+  precision: bf16
+  compile: true
+  cudnn_benchmark: true
+paths:
+  workdir: gd/runs
+  runs_root: gd/runs
+  dataset_root: data_cache
+
+data:
+  resolution: 64
+  K: 16
+  sublattice_resolved_ldos: true
+  target_representation: ldos_ab
+  cache_require_physics_meta: true
+  ldos_canonical_layout: k_s_h_w
+  ldos_model_layout: flat_channels
+  energies:
+    mode: linspace
+    Emin: -0.3
+    Emax: 0.3
+    list: []
+  split:
+    train: 0.9
+    val: 0.05
+    test: 0.05
+  ldos_transform:
+    enabled: true
+    apply_to_cache: true
+    log:
+      enabled: false
+      eps: 1.0e-6
+    quantile:
+      enabled: false
+      eps: 1.0e-6
+    scale: 100000.0
+    cache_scaled: true
+  return_physics_meta: false
+  num_samples_total: 20000
+  cache_shard_size: 64
+  shard_cache_size: 2
+  num_workers: 8
+  shard_workers: 6
+  pin_memory: true
+  persistent_workers: true
+  prefetch_factor: 2
+
+potential_sampler:
+  family: mixed
+  normalize: true
+  structural:
+    enabled: true
+    family: mixed
+    mixed:
+      weights:
+        vacancy: 1.0
+        bond_disorder: 1.0
+        sublattice_selective: 1.0
+    vacancy:
+      concentration_range: [0.0, 0.03]
+      cluster_prob: 0.0
+      ab_balance: 0.5
+      sublattice_bias: false
+    bond_disorder:
+      delta_range: [0.0, 0.15]
+      missing_bond_prob: 0.01
+      apply_prob: 1.0
+    sublattice_selective:
+      amplitude_range: [0.0, 0.2]
+      mode: ab_opposite
+  mixed:
+    weights:
+      point_impurity: 1.0
+  point_impurity:
+    num_points_range: [1, 4]
+    amplitude_range: [-1.0, 1.0]
+    blob_sigma_range: [0.0, 1.0]
+
+physics:
+  backend: kwant
+  kpm:
+    enabled: true
+    moments: 64
+    jackson_kernel: true
+    num_random_vectors: 1
+    eta: 0.01
+  hamiltonian:
+    type: graphene
+    random_lattice_types: [graphene]
+    random_lattice_weights: [1.0]
+    lattice_constant: 1.0
+    t: 2.7
+    add_mass: false
+    mass: 0.0
+    add_soc: false
+    soc_strength: 0.0
+    add_mag_field: false
+    mag_field: 0.0
+    add_nnn: false
+    t2: 0.0
+
+degradation:
+  enabled: false
+  apply_prob: 0.0
+  tip_convolution:
+    enabled: false
+    prob: 0.0
+  stripe_noise:
+    enabled: false
+    prob: 0.0
+  drift:
+    enabled: false
+    prob: 0.0
+  gaussian_noise:
+    enabled: false
+    prob: 0.0
+  crop:
+    enabled: false
+    prob: 0.0
+
+vae:
+  mode: vae
+  latent_downsample: 2
+  latent_channels: 8
+  encoder:
+    base_channels: 96
+    num_res_blocks: 3
+    attn_resolutions: []
+    dropout: 0.0
+  decoder:
+    base_channels: 96
+    num_res_blocks: 3
+    attn_resolutions: []
+    dropout: 0.0
+  kl:
+    weight: 1.0e-6
+  recon_loss_type: log_cosh
+  recon_log_cosh_eps: 1.0e-6
+  training:
+    batch_size: 32
+    lr: 1.0e-4
+    weight_decay: 0.0
+    grad_clip: 1.0
+    max_steps: 100000
+    log_every: 100
+    ckpt_every: 2000
+    val_every: 2000
+
+latent_green:
+  enabled: true
+  conditioning:
+    use_physics_meta: true
+    scalar_keys: [hopping]
+    embed_dim: 64
+    inject_mode: film
+  model:
+    arch: unet_up
+    base_channels: 128
+    num_res_blocks: 4
+    dropout: 0.0
+    data_loss_domain: linear_normalized
+    use_timestep: true
+    time_embed_dim: 128
+    time_embed_freq: 128
+    use_fft_loss: false
+    fft_loss_weight: 0.0
+    stats_loss_weight: 0.0
+    linear_scale_loss_weight: 0.0
+    multiscale_loss_weight: 0.0
+    multiscale_scales: [2, 4]
+    loss_type: huber
+    huber_beta: 0.1
+    psd_loss_weight: 0.0
+    psd_eps: 1.0e-8
+    per_energy_affine: false
+    energy_align:
+      enabled: false
+      max_shift: 0
+    log_cosh_eps: 1.0e-6
+    aux_warmup_steps: 0
+    residual_loss_weight: 1.0
+    physics_losses:
+      data_weight: 1.0
+      residual_weight: 1.0
+      sum_rule_weight: 0.1
+      nonneg_weight: 0.0
+      kk_weight: 0.0
+      symmetry_weight: 0.0
+      sum_rule_target: 1.0
+      sum_rule_norm: trapz
+  noisy_latent_training:
+    enabled: true
+    T: 1000
+    schedule: cosine
+    clean_prob: 0.1
+  training:
+    batch_size: 16
+    lr: 1.0e-4
+    weight_decay: 0.0
+    grad_clip: 1.0
+    max_steps: 40000
+    log_every: 50
+    ckpt_every: 2000
+    debug_fixed_batch: false
+    surrogate_check:
+      enabled: false
+      rel_l2_max: 0.3
+      warmup_steps: 0
+    lr_schedule:
+      enabled: true
+      type: cosine
+      warmup_steps: 2000
+      min_lr_ratio: 0.1
+      warmup_min_ratio: 0.1
+
+diffusion:
+  T: 1000
+  schedule: cosine
+  condition_encoder:
+    base_channels: 64
+    num_layers: 3
+    token_dim: 384
+    normalize: false
+    norm_eps: 1.0e-6
+    mode: map
+    use_coords: true
+    scale: 1.0
+    learnable_scale: false
+  model:
+    type: dit
+    use_green_attention: false
+    cond_mode: concat
+    patch_size: 2
+    hidden_size: 384
+    num_heads: 6
+    depth: 12
+    mlp_ratio: 4.0
+    dropout: 0.0
+  training:
+    batch_size: 8
+    lr: 1.0e-4
+    weight_decay: 0.0
+    grad_clip: 1.0
+    max_steps: 300000
+    log_every: 50
+    log_smooth_window: 20
+    ckpt_every: 5000
+    val_every: 5000
+    vis_fixed_n: 4
+    prediction_type: v
+    x0_loss_weight: 0.1
+    phys_loss_weight: 0.05
+    phys_loss_type: huber
+    huber_beta: 0.1
+    psd_loss_weight: 0.01
+    psd_eps: 1.0e-8
+    per_energy_affine: false
+    energy_align:
+      enabled: false
+      max_shift: 0
+    phys_warmup:
+      enabled: true
+      warmup_steps: 20000
+      start_ratio: 0.0
+      end_ratio: 1.0
+    energy_weights: []
+    energy_weight_mode: uniform
+    energy_weight_eps: 1.0e-6
+    energy_weight_power: 1.0
+    consistency_loss_weight: 0.0
+    topk_phys:
+      enabled: false
+      k: 0
+    lr_schedule:
+      enabled: true
+      type: cosine
+      warmup_steps: 5000
+      min_lr_ratio: 0.1
+      warmup_min_ratio: 0.1
+    latent_scale:
+      mode: auto
+      target_std: 1.0
+      scale: 1.0
+      eps: 1.0e-6
+    min_snr:
+      enabled: true
+      gamma: 5.0
+    ema:
+      enabled: true
+      decay: 0.9999
+  sampler:
+    steps: 50
+    eta: 0.0
+
+guidance:
+  enabled: false
+  use_latent_green: true
+  loss:
+    type: obs_consistency
+  lambda:
+    lambda0: 8.0
+    schedule: late_strong
+    start_step: 400
+    grad_steps_per_iter: 1
+
+validation:
+  enabled: false
+  kpm_check:
+    enabled: false
+    epsilon:
+      mode: fixed
+      c: 1.0
+    sigma_noise_est:
+      method: mad
+      floor: 1.0e-6
+  restart:
+    enabled: false
+    max_restarts: 0
+    t_restart: 20
+    noise_scale: 1.0
+
+student:
+  enabled: true
+  model:
+    arch: unet
+    base_channels: 64
+    num_res_blocks: 2
+    dropout: 0.0
+  loss:
+    imitation:
+      type: l1
+      weight: 1.0
+    physics:
+      enabled: true
+      weight_max: 0.1
+      warmup_steps: 20000
+      robust: charbonnier
+      charbonnier_eps: 1.0e-3
+      huber_delta: 0.1
+  training:
+    batch_size: 4
+    lr: 1.0e-4
+    weight_decay: 0.0
+    grad_clip: 1.0
+    max_steps: 50000
+    log_every: 50
+    ckpt_every: 2000
+
+eval:
+  save_samples: false
+  num_visualize: 2
+  metrics: [l1_V, l2_V]
+
+wandb:
+  enabled: false
+  project: GreenDiff
