@@ -1,2 +1,0 @@
-"""Core infrastructure for gd."""
-
