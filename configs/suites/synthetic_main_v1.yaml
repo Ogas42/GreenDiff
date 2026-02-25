@@ -1,0 +1,17 @@
+suite:
+  name: synthetic_main_v1
+  description: "Pure synthetic benchmark suite for 3-4 week sprint (VAE + Green focus)."
+  data_mainline: pure_synthetic
+  seeds: [42, 43, 44]
+  stages: [vae, green]
+  eval:
+    target: green
+    split: val
+    max_batches: 50
+  variants:
+    - baseline
+    - no_fft_psd
+    - no_multiscale
+    - small_model
+    - no_residual
+
