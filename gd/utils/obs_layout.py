@@ -167,6 +167,8 @@ def cache_ldos_schema_metadata(config_or_data_cfg: Mapping[str, Any]) -> Dict[st
         "target_representation": target_rep,
         "contains_physics_meta": contains_physics_meta,
         "contains_defect_meta": contains_defect_meta,
+        # Cache stores V targets too; per-sample normalization changes target semantics.
+        "potential_normalize": bool(potential_cfg.get("normalize", False)) if isinstance(potential_cfg, Mapping) else False,
     }
     if is_sublattice_resolved(data_cfg):
         _require_layout_flags(data_cfg)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 import time
 from typing import Any, Dict
 
@@ -19,6 +20,22 @@ from gd.utils.ldos_transform import force_linear_ldos_mode
 def _ckpt_step(path: str) -> int:
     m = re.search(r"_step_(\d+)\.pt$", os.path.basename(path))
     return int(m.group(1)) if m else 0
+
+
+def _cfg_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in {"1", "true", "yes", "y", "on"}:
+            return True
+        if s in {"0", "false", "no", "n", "off"}:
+            return False
+    return bool(value)
 
 
 class VAETrainer(StageTrainer):
@@ -107,10 +124,18 @@ class VAETrainer(StageTrainer):
         log_every = int(train_cfg["log_every"])
         grad_clip = float(train_cfg.get("grad_clip", 0.0))
         ckpt_every = int(train_cfg.get("ckpt_every", 2000))
+        show_progress_bar = _cfg_bool(train_cfg.get("show_progress_bar", True), default=True)
+        if not sys.stderr.isatty():
+            show_progress_bar = False
+        if ctx.dist.is_main:
+            print(
+                f"[gd.vae_trainer] show_progress_bar={show_progress_bar} "
+                f"(cfg={train_cfg.get('show_progress_bar', None)!r}, stderr_tty={sys.stderr.isatty()})"
+            )
         step = int(resume_state.step)
 
         tqdm = get_tqdm()
-        pbar = tqdm(total=max_steps, initial=step, desc="Training VAE") if ctx.dist.is_main else None
+        pbar = tqdm(total=max_steps, initial=step, desc="Training VAE") if (ctx.dist.is_main and show_progress_bar) else None
         t0 = time.time()
         last_losses: Dict[str, float] = {}
 

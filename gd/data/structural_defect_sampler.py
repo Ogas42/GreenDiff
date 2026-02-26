@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 
 import torch
+import torch.nn.functional as F
 
 
 class StructuralDefectSampler:
@@ -127,15 +128,59 @@ class StructuralDefectSampler:
         amp = float(amp_min) + (float(amp_max) - float(amp_min)) * float(torch.rand(1, generator=gen).item())
         sign = -1.0 if float(torch.rand(1, generator=gen).item()) < 0.5 else 1.0
         amp = amp * sign
+        if abs(amp) < 1.0e-12:
+            return torch.zeros((2, H, W), dtype=torch.float32)
+
+        # Spatially correlated field (instead of global constant bias) so A/B asymmetry
+        # remains visible as a local pattern and not a single-color panel.
+        field = self._sample_correlated_scalar_field(H, W, gen)
         out = torch.zeros((2, H, W), dtype=torch.float32)
         if mode == "ab_opposite":
-            out[0].fill_(amp)
-            out[1].fill_(-amp)
+            out[0] = amp * field
+            out[1] = -amp * field
         elif mode == "a_only":
-            out[0].fill_(amp)
+            out[0] = amp * field
         elif mode == "b_only":
-            out[1].fill_(amp)
+            out[1] = amp * field
         else:
             raise ValueError(f"Unknown sublattice_selective.mode: {mode}")
         return out
 
+    def _sample_correlated_scalar_field(self, H: int, W: int, gen: torch.Generator) -> torch.Tensor:
+        # Correlation scale as a fraction of lattice size; defaults keep features local
+        # while remaining smooth enough to look like a correlated sublattice perturbation.
+        frac_min, frac_max = self.sub_cfg.get("correlation_frac_range", [0.06, 0.18])
+        frac_min = float(frac_min)
+        frac_max = float(frac_max)
+        if frac_max < frac_min:
+            frac_min, frac_max = frac_max, frac_min
+        frac = frac_min + (frac_max - frac_min) * float(torch.rand(1, generator=gen).item())
+        k = max(3, int(round(frac * min(H, W))))
+        if k % 2 == 0:
+            k += 1
+
+        x = torch.randn((1, 1, H, W), generator=gen, dtype=torch.float32)
+        # Two-pass box smoothing approximates a low-frequency correlated field cheaply.
+        x = F.avg_pool2d(x, kernel_size=k, stride=1, padding=k // 2)
+        x = F.avg_pool2d(x, kernel_size=k, stride=1, padding=k // 2)
+
+        # Optional localization envelope to avoid fully global bias-like appearance.
+        env_prob = float(self.sub_cfg.get("localized_envelope_prob", 0.7))
+        if float(torch.rand(1, generator=gen).item()) < env_prob:
+            ek = max(3, int(round(0.5 * k)))
+            if ek % 2 == 0:
+                ek += 1
+            env = torch.rand((1, 1, H, W), generator=gen, dtype=torch.float32)
+            env = F.avg_pool2d(env, kernel_size=ek, stride=1, padding=ek // 2)
+            env = F.avg_pool2d(env, kernel_size=ek, stride=1, padding=ek // 2)
+            q = float(self.sub_cfg.get("localized_quantile", 0.55))
+            q = max(0.0, min(1.0, q))
+            thresh = torch.quantile(env.flatten(), q)
+            env = (env - thresh).clamp_min(0.0)
+            env = env / env.amax().clamp_min(1.0e-6)
+            x = x * env
+
+        x = x - x.mean()
+        max_abs = x.abs().amax().clamp_min(1.0e-6)
+        x = x / max_abs
+        return x[0, 0]

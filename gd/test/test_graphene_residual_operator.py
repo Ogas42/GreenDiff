@@ -79,3 +79,32 @@ def test_linear_normalized_data_loss_ignores_align_and_affine_flags():
     la = m_a.loss(g_pred, g_obs)["data_loss"]
     lb = m_b.loss(g_pred, g_obs)["data_loss"]
     assert torch.allclose(la, lb, atol=1.0e-6, rtol=1.0e-6)
+
+
+def test_peak_control_losses_penalize_peak_overshoot():
+    cfg = _small_cfg()
+    cfg["latent_green"]["model"]["peak_control"] = {
+        "enabled": True,
+        "log_aux_weight": 0.10,
+        "log_aux_huber_beta": 0.1,
+        "log_aux_scale": "p95_obs_per_sample",
+        "topk_loss_weight": 0.20,
+        "topk_frac": 0.05,
+        "topk_huber_beta": 0.1,
+        "peak_ratio_penalty_weight": 0.05,
+        "peak_ratio_cap": 2.0,
+    }
+    m = LatentGreen(cfg).eval()
+    B, K, H, W = 2, cfg["data"]["K"], cfg["data"]["resolution"], cfg["data"]["resolution"]
+    g_obs_lin = torch.full((B, K, 2, H, W), 0.05)
+    g_obs_lin[:, :, :, 2, 2] = 0.2
+    g_obs = ldos_obs_from_linear(g_obs_lin, cfg["data"])
+
+    pred_lin_c = g_obs_lin.clone()
+    pred_lin_c[:, :, :, 2, 2] = 1.5
+    g_pred = pred_lin_c.permute(0, 2, 1, 3, 4).reshape(B, 2 * K, H, W)
+
+    losses = m.loss(g_pred, g_obs)
+    assert float(losses["log_aux_loss"].item()) > 0.0
+    assert float(losses["topk_peak_loss"].item()) > 0.0
+    assert float(losses["peak_ratio_penalty"].item()) > 0.0

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 import time
 from collections import deque
 from typing import Any, Dict
@@ -32,6 +33,22 @@ def _to_device_tree(x, device, non_blocking: bool = True):
     if isinstance(x, dict):
         return {k: _to_device_tree(v, device, non_blocking=non_blocking) for k, v in x.items()}
     return x
+
+
+def _cfg_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in {"1", "true", "yes", "y", "on"}:
+            return True
+        if s in {"0", "false", "no", "n", "off"}:
+            return False
+    return bool(value)
 
 
 class LatentGreenTrainer(StageTrainer):
@@ -101,6 +118,14 @@ class LatentGreenTrainer(StageTrainer):
         log_every = int(train_cfg["log_every"])
         grad_clip = float(train_cfg.get("grad_clip", 0.0))
         ckpt_every = int(train_cfg.get("ckpt_every", 2000))
+        show_progress_bar = _cfg_bool(train_cfg.get("show_progress_bar", True), default=True)
+        if not sys.stderr.isatty():
+            show_progress_bar = False
+        if ctx.dist.is_main:
+            print(
+                f"[gd.green_trainer] show_progress_bar={show_progress_bar} "
+                f"(cfg={train_cfg.get('show_progress_bar', None)!r}, stderr_tty={sys.stderr.isatty()})"
+            )
         step = int(resume_state.step)
         start_step = step
 
@@ -109,7 +134,11 @@ class LatentGreenTrainer(StageTrainer):
         data_cfg = cfg.get("data", {})
 
         tqdm = get_tqdm()
-        pbar = tqdm(total=max_steps, initial=step, desc="Training Latent Green", dynamic_ncols=True) if ctx.dist.is_main else None
+        pbar = (
+            tqdm(total=max_steps, initial=step, desc="Training Latent Green", dynamic_ncols=True)
+            if (ctx.dist.is_main and show_progress_bar)
+            else None
+        )
         smooth_window = int(train_cfg.get("log_smooth_window", 50))
         loss_hist = deque(maxlen=max(1, smooth_window))
         data_hist = deque(maxlen=max(1, smooth_window))
@@ -168,6 +197,9 @@ class LatentGreenTrainer(StageTrainer):
                     "stats_loss": float(losses.get("stats_loss", torch.zeros((), device=device)).detach().item()),
                     "psd_loss": float(losses.get("psd_loss", torch.zeros((), device=device)).detach().item()),
                     "ms_loss": float(losses.get("ms_loss", torch.zeros((), device=device)).detach().item()),
+                    "log_aux_loss": float(losses.get("log_aux_loss", torch.zeros((), device=device)).detach().item()),
+                    "topk_peak_loss": float(losses.get("topk_peak_loss", torch.zeros((), device=device)).detach().item()),
+                    "peak_ratio_penalty": float(losses.get("peak_ratio_penalty", torch.zeros((), device=device)).detach().item()),
                     "residual_loss": float(losses.get("residual_loss", torch.zeros((), device=device)).detach().item()),
                     "sum_rule_loss": float(losses.get("sum_rule_loss", torch.zeros((), device=device)).detach().item()),
                 }
@@ -208,6 +240,9 @@ class LatentGreenTrainer(StageTrainer):
                             "stats_loss": last_scalar["stats_loss"],
                             "psd_loss": last_scalar["psd_loss"],
                             "ms_loss": last_scalar["ms_loss"],
+                            "log_aux_loss": last_scalar.get("log_aux_loss"),
+                            "topk_peak_loss": last_scalar.get("topk_peak_loss"),
+                            "peak_ratio_penalty": last_scalar.get("peak_ratio_penalty"),
                             "residual_loss": last_scalar["residual_loss"],
                             "sum_rule_loss": last_scalar["sum_rule_loss"],
                             "rel_model": last_rel_model,

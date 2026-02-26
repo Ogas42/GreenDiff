@@ -162,6 +162,9 @@ def main():
         "rel_phys_scaled": [],
         "scale_factor": [],
         "mean_ratio": [],
+        "peak_ratio": [],
+        "pred_p99_over_obs_p99": [],
+        "pred_std_over_obs_std": [],
         "psd_error": [],
         "residual": [],
         "hopping_mean": [],
@@ -274,6 +277,14 @@ def main():
 
             mean_ratio = pred_lin_raw.mean(dim=(1, 2, 3)) / obs_lin_raw.mean(dim=(1, 2, 3)).clamp_min(1.0e-6)
             metrics["mean_ratio"].append(mean_ratio.mean().item())
+            peak_ratio = pred_lin_raw.amax(dim=(1, 2, 3)) / obs_lin_raw.amax(dim=(1, 2, 3)).clamp_min(1.0e-6)
+            metrics["peak_ratio"].extend(peak_ratio.detach().cpu().tolist())
+            pred_flat_q = pred_lin_raw.reshape(pred_lin_raw.shape[0], -1)
+            obs_flat_q = obs_lin_raw.reshape(obs_lin_raw.shape[0], -1)
+            p99_ratio = torch.quantile(pred_flat_q, 0.99, dim=1) / torch.quantile(obs_flat_q, 0.99, dim=1).clamp_min(1.0e-6)
+            metrics["pred_p99_over_obs_p99"].extend(p99_ratio.detach().cpu().tolist())
+            std_ratio = pred_lin_raw.std(dim=(1, 2, 3)) / obs_lin_raw.std(dim=(1, 2, 3)).clamp_min(1.0e-6)
+            metrics["pred_std_over_obs_std"].extend(std_ratio.detach().cpu().tolist())
 
             pred_fft = torch.fft.rfft2(pred_lin_raw, norm="ortho")
             obs_fft = torch.fft.rfft2(obs_lin_raw, norm="ortho")
@@ -324,6 +335,9 @@ def main():
     print_stat("Rel L2 (Physical/Linear, Scaled)", "rel_phys_scaled")
     print_stat("Optimal Scale Factor", "scale_factor")
     print_stat("Mean Ratio (Pred/Obs, Linear)", "mean_ratio")
+    print_stat("Peak Ratio (Pred/Obs, Linear)", "peak_ratio")
+    print_stat("P99 Ratio (Pred/Obs, Linear)", "pred_p99_over_obs_p99")
+    print_stat("Std Ratio (Pred/Obs, Linear)", "pred_std_over_obs_std")
     print("-" * 60)
     print_stat("PSD Error (Texture)", "psd_error")
     print_stat("Physical Residual", "residual", ".2e")

@@ -8,7 +8,6 @@ from collections import deque
 import torch.nn.functional as F
 import torch.distributed as dist
 from torch.utils.data import DataLoader, DistributedSampler
-import matplotlib.pyplot as plt
 from typing import Dict, Any
 from gd.data.dataset import GFDataset
 from gd.models.vae import VAE
@@ -24,6 +23,7 @@ from gd.utils.obs_layout import (
     g_obs_to_canonical_view,
     is_sublattice_resolved,
 )
+from gd.trainers.diffusion_validation import render_diffusion_comparison_grid
 
 # Fix for OMP: Error #15: Initializing libomp.dll, but found libiomp5md.dll already initialized.
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -52,6 +52,7 @@ def train_diffusion(config: Dict[str, Any]):
     is_main = (not is_distributed) or rank == 0
     force_linear_ldos_mode(config, verbose=is_main, context="train_diffusion")
     train_cfg = config["diffusion"]["training"]
+    show_progress_bar = bool(train_cfg.get("show_progress_bar", True))
     energy_weights_cfg = train_cfg.get("energy_weights", [])
     if isinstance(energy_weights_cfg, (list, tuple)):
         energy_weights = list(energy_weights_cfg)
@@ -259,10 +260,18 @@ def train_diffusion(config: Dict[str, Any]):
         fixed_vis_batch = None
         if fixed_vis_n > 0:
             fixed_batch = next(iter(loader))
+            def _slice_clone_tree(x, n: int):
+                if torch.is_tensor(x):
+                    return x[:n].clone()
+                if isinstance(x, dict):
+                    return {k: _slice_clone_tree(v, n) for k, v in x.items()}
+                return x
             fixed_vis_batch = {
                 "g_obs": fixed_batch["g_obs"][:fixed_vis_n].clone(),
                 "V": fixed_batch["V"][:fixed_vis_n].clone(),
             }
+            if isinstance(fixed_batch, dict) and "defect_meta" in fixed_batch:
+                fixed_vis_batch["defect_meta"] = _slice_clone_tree(fixed_batch["defect_meta"], fixed_vis_n)
     
     max_steps = train_cfg["max_steps"]
     log_every = train_cfg["log_every"]
@@ -309,7 +318,7 @@ def train_diffusion(config: Dict[str, Any]):
             return _normalize_energy_weights(w)
         return None
     
-    pbar = tqdm(total=max_steps, initial=step, desc="Training Diffusion") if is_main else None
+    pbar = tqdm(total=max_steps, initial=step, desc="Training Diffusion") if (is_main and show_progress_bar) else None
     
     while step < max_steps:
         if sampler is not None:
@@ -364,72 +373,75 @@ def train_diffusion(config: Dict[str, Any]):
                 loss = (weight * per_sample).mean()
             else:
                 loss = F.mse_loss(pred, target)
-            x0_pred = None
-            if x0_loss_weight > 0 or phys_loss_weight > 0:
-                if prediction_type == "v":
-                    x0_pred = alpha_t * z_t - sigma_t * pred
-                elif prediction_type == "x0":
-                    x0_pred = pred
-                else:
-                    x0_pred = (z_t - sigma_t * pred) / alpha_t.clamp_min(1.0e-6)
-            
-            raw_x0_loss_val = None
+            if prediction_type == "v":
+                x0_pred = alpha_t * z_t - sigma_t * pred
+            elif prediction_type == "x0":
+                x0_pred = pred
+            else:
+                x0_pred = (z_t - sigma_t * pred) / alpha_t.clamp_min(1.0e-6)
+
+            # Always compute x0 monitor metrics so diffusion quality can be tracked
+            # even when x0_loss_weight == 0.
+            x0_loss_per_sample = F.mse_loss(x0_pred, z, reduction='none').mean(dim=(1, 2, 3))
+            x0_sample_weight = alpha_t.view(-1) ** 2
+            x0_loss = (x0_loss_per_sample * x0_sample_weight).mean()
+            with torch.no_grad():
+                raw_x0_loss_val = F.mse_loss(x0_pred, z).item()
+
             if x0_loss_weight > 0:
                 # Weight x0 loss by alpha_t^2 (or SNR) to suppress contributions from high noise steps
                 # where reconstruction is unstable.
-                x0_loss_per_sample = F.mse_loss(x0_pred, z, reduction='none').mean(dim=(1, 2, 3))
-                x0_sample_weight = alpha_t.view(-1) ** 2
-                x0_loss = (x0_loss_per_sample * x0_sample_weight).mean()
                 loss = loss + x0_loss_weight * x0_loss
-                
-                with torch.no_grad():
-                    raw_x0_loss_val = F.mse_loss(x0_pred, z).item()
 
             raw_phys_loss_val = None
             raw_const_loss_val = None
+            t_zeros = torch.zeros((z.shape[0],), dtype=torch.long, device=z.device)
+
+            def _compute_phys_terms(x0_in):
+                g_pred_phys = lg_core(x0_in, t_zeros)
+                g_pred_phys_for_loss = ldos_obs_from_linear(g_pred_phys, data_cfg)
+                pred_phys = g_obs_to_canonical_view(g_pred_phys_for_loss, data_cfg) if sublattice_resolved else g_pred_phys_for_loss
+                obs_phys = g_obs
+                if use_per_energy_affine:
+                    pred_phys = per_energy_affine(pred_phys, obs_phys)
+                pred_phys, per_energy_loss = align_pred(
+                    pred_phys,
+                    obs_phys,
+                    enabled=align_enabled,
+                    max_shift=align_max_shift,
+                    loss_type=phys_loss_type,
+                    huber_beta=huber_beta,
+                    log_cosh_eps=log_cosh_eps,
+                )
+                if len(energy_weights) == g_obs.shape[1]:
+                    w = torch.tensor(energy_weights, device=device, dtype=per_energy_loss.dtype)
+                    w = _normalize_energy_weights(w).view(1, -1)
+                    per_energy_loss = per_energy_loss * w
+                else:
+                    w_dyn = _energy_weights_from_obs(obs_phys)
+                    if w_dyn is not None:
+                        per_energy_loss = per_energy_loss * w_dyn.view(1, -1)
+                if topk_enabled and topk_k > 0:
+                    k_val = min(topk_k, per_energy_loss.shape[1])
+                    phys_loss_per_sample = torch.topk(per_energy_loss, k_val, dim=1).values.mean(dim=1)
+                else:
+                    phys_loss_per_sample = per_energy_loss.mean(dim=1)
+                psd_per_sample = torch.zeros_like(phys_loss_per_sample)
+                if psd_loss_weight > 0:
+                    psd_per_sample = _psd_loss_per_sample(pred_phys, obs_phys)
+                return phys_loss_per_sample, psd_per_sample, pred_phys
+
+            phys_coeff = 0.0
+            phys_loss_val = None
+            should_monitor_phys = is_main and (step % log_every == 0)
+            pred_for_cons = None
+            phys_sample_weight = alpha_t.view(-1) ** 2
+
             if phys_loss_weight > 0:
-                t_zeros = torch.zeros((z.shape[0],), dtype=torch.long, device=z.device)
-
-                def _compute_phys_terms(x0_in):
-                    g_pred_phys = lg_core(x0_in, t_zeros)
-                    g_pred_phys_for_loss = ldos_obs_from_linear(g_pred_phys, data_cfg)
-                    pred = g_obs_to_canonical_view(g_pred_phys_for_loss, data_cfg) if sublattice_resolved else g_pred_phys_for_loss
-                    obs = g_obs
-                    if use_per_energy_affine:
-                        pred = per_energy_affine(pred, obs)
-                    pred, per_energy_loss = align_pred(
-                        pred,
-                        obs,
-                        enabled=align_enabled,
-                        max_shift=align_max_shift,
-                        loss_type=phys_loss_type,
-                        huber_beta=huber_beta,
-                        log_cosh_eps=log_cosh_eps,
-                    )
-                    if len(energy_weights) == g_obs.shape[1]:
-                        w = torch.tensor(energy_weights, device=device, dtype=per_energy_loss.dtype)
-                        w = _normalize_energy_weights(w).view(1, -1)
-                        per_energy_loss = per_energy_loss * w
-                    else:
-                        w_dyn = _energy_weights_from_obs(obs)
-                        if w_dyn is not None:
-                            per_energy_loss = per_energy_loss * w_dyn.view(1, -1)
-                    if topk_enabled and topk_k > 0:
-                        k_val = min(topk_k, per_energy_loss.shape[1])
-                        phys_loss_per_sample = torch.topk(per_energy_loss, k_val, dim=1).values.mean(dim=1)
-                    else:
-                        phys_loss_per_sample = per_energy_loss.mean(dim=1)
-                    psd_per_sample = torch.zeros_like(phys_loss_per_sample)
-                    if psd_loss_weight > 0:
-                        psd_per_sample = _psd_loss_per_sample(pred, obs)
-                    return phys_loss_per_sample, psd_per_sample, pred
-
                 phys_loss_per_sample, psd_per_sample, pred_for_cons = _compute_phys_terms(x0_pred)
-
                 with torch.no_grad():
                     raw_phys_loss_val = phys_loss_per_sample.mean().item()
 
-                phys_sample_weight = alpha_t.view(-1) ** 2
                 phys_loss = (phys_loss_per_sample * phys_sample_weight).mean()
                 total_phys = phys_loss
                 if psd_loss_weight > 0:
@@ -441,7 +453,8 @@ def train_diffusion(config: Dict[str, Any]):
                     ramp = min(float(step + 1) / float(phys_warmup_steps), 1.0)
                     phys_coeff = phys_loss_weight * (phys_start_ratio + (phys_end_ratio - phys_start_ratio) * ramp)
                 loss = loss + phys_coeff * total_phys
-                
+                phys_loss_val = phys_loss.item()
+
                 if consistency_loss_weight > 0:
                     pred_diff = pred_for_cons[:, 1:] - pred_for_cons[:, :-1]
                     obs_diff = g_obs[:, 1:] - g_obs[:, :-1]
@@ -452,8 +465,16 @@ def train_diffusion(config: Dict[str, Any]):
                     loss = loss + consistency_loss_weight * weighted_const_loss
                     with torch.no_grad():
                         raw_const_loss_val = const_loss_per_sample.mean().item()
-            else:
-                phys_coeff = None
+            elif should_monitor_phys:
+                with torch.no_grad():
+                    phys_loss_per_sample, _psd_monitor, pred_for_cons = _compute_phys_terms(x0_pred.detach())
+                    raw_phys_loss_val = phys_loss_per_sample.mean().item()
+                    pred_diff = pred_for_cons[:, 1:] - pred_for_cons[:, :-1]
+                    obs_diff = g_obs[:, 1:] - g_obs[:, :-1]
+                    const_map = F.mse_loss(pred_diff, obs_diff, reduction='none')
+                    reduce_dims = tuple(range(1, const_map.dim()))
+                    const_loss_per_sample = const_map.mean(dim=reduce_dims)
+                    raw_const_loss_val = const_loss_per_sample.mean().item()
             loss_hist.append(loss.item())
             x0_hist.append(raw_x0_loss_val)
             phys_hist.append(raw_phys_loss_val)
@@ -504,8 +525,7 @@ def train_diffusion(config: Dict[str, Any]):
                     weight_mean = weight.mean().item()
                 else:
                     weight_mean = 1.0
-                x0_loss_val = x0_loss.item() if x0_loss_weight > 0 else None
-                phys_loss_val = phys_loss.item() if phys_loss_weight > 0 else None
+                x0_loss_val = x0_loss.item()
                 x0_raw_str = f"{raw_x0_loss_val:.6f}" if raw_x0_loss_val is not None else "na"
                 x0_w_str = f"{x0_loss_val:.6f}" if x0_loss_val is not None else "na"
                 phys_str = f"{raw_phys_loss_val:.6f}" if raw_phys_loss_val is not None else "na"
@@ -519,11 +539,12 @@ def train_diffusion(config: Dict[str, Any]):
                 const_vals = [v for v in consistency_hist if v is not None]
                 const_avg = sum(const_vals) / max(1, len(const_vals)) if const_vals else None
                 const_avg_str = f"{const_avg:.6f}" if const_avg is not None else "na"
-                phys_coeff_val = phys_coeff if phys_loss_weight > 0 else None
-                phys_coeff_str = f"{phys_coeff_val:.4f}" if phys_coeff_val is not None else "na"
+                phys_coeff_val = phys_coeff
+                phys_coeff_str = f"{phys_coeff_val:.4f}"
                 phys_coeff_vals = [v for v in phys_coeff_hist if v is not None]
                 phys_coeff_avg = sum(phys_coeff_vals) / max(1, len(phys_coeff_vals)) if phys_coeff_vals else None
                 phys_coeff_avg_str = f"{phys_coeff_avg:.4f}" if phys_coeff_avg is not None else "na"
+                const_step_str = f"{raw_const_loss_val:.6f}" if raw_const_loss_val is not None else "na"
                 postfix = {
                     "loss": f"{loss.item():.6f}",
                     "lr": f"{current_lr:.2e}",
@@ -531,7 +552,7 @@ def train_diffusion(config: Dict[str, Any]):
                     "const": const_avg_str,
                 }
                 pbar.set_postfix(postfix)
-                print(f"[stats] step={step} bs={z.shape[0]} loss={loss.item():.6f} lr={current_lr:.2e} x0_raw={x0_raw_str} x0_w={x0_w_str} phys={phys_str} const={raw_const_loss_val} phys_w={phys_coeff_str}")
+                print(f"[stats] step={step} bs={z.shape[0]} loss={loss.item():.6f} lr={current_lr:.2e} x0_raw={x0_raw_str} x0_w={x0_w_str} phys={phys_str} const={const_step_str} phys_w={phys_coeff_str}")
                 print(f"[avg] loss={loss_avg:.6f} x0_raw={x0_avg_str} phys={phys_avg_str} const={const_avg_str} phys_w={phys_coeff_avg_str}")
                 print(f"[stats] z={z_mean:.4f}/{z_std:.4f} snr={snr_mean:.2f}/{snr_min:.2f}/{snr_max:.2f} w={weight_mean:.3f}")
 
@@ -553,9 +574,11 @@ def train_diffusion(config: Dict[str, Any]):
                     if fixed_vis_batch is not None:
                         g_val = fixed_vis_batch["g_obs"].to(device, non_blocking=True)
                         V_true = fixed_vis_batch["V"].to(device, non_blocking=True)
+                        defect_meta_val = fixed_vis_batch.get("defect_meta")
                     else:
                         g_val = g_obs
                         V_true = V
+                        defect_meta_val = batch.get("defect_meta") if isinstance(batch, dict) else None
                     n_val = min(int(train_cfg.get("vis_fixed_n", 4) or 4), g_val.shape[0])
                     g_val = g_val[:n_val]
                     V_true = V_true[:n_val]
@@ -573,89 +596,22 @@ def train_diffusion(config: Dict[str, Any]):
                             val_sampler.unscale_factor = 1.0
                         V_pred = val_sampler.sample(g_val)
                         
-                    # Visualize
-                    fig, axes = plt.subplots(n_val, 6, figsize=(22, 4 * n_val))
-                    if n_val == 1: axes = axes[None, :]
-                    k0 = 0
-                    k1 = g_val.shape[1] // 2
-                    k2 = g_val.shape[1] - 1
-                    g_val_agg = aggregate_sublattice_ldos(g_val) if sublattice_resolved else g_val
-                    
-                    for i in range(n_val):
-                        v_true_i = V_true[i]
-                        if v_true_i.dim() == 3 and v_true_i.shape[0] == 1:
-                            v_true_i = v_true_i[0]
-                        v_pred_i = V_pred[i]
-                        if v_pred_i.dim() == 3 and v_pred_i.shape[0] == 1:
-                            v_pred_i = v_pred_i[0]
-                        v_true_np = v_true_i.detach().cpu().numpy()
-                        v_pred_np = v_pred_i.detach().cpu().numpy()
-                        # Use a shared symmetric color scale so GT/Prediction are visually comparable.
-                        v_vis_abs = max(
-                            1.0,
-                            float(abs(v_true_i).max().item()),
-                            float(abs(v_pred_i).max().item()),
-                        )
-                        axes[i, 0].imshow(
-                            v_true_np,
-                            cmap="inferno",
-                            vmin=-v_vis_abs,
-                            vmax=v_vis_abs,
-                            interpolation="nearest",
-                        )
-                        axes[i, 0].set_title(
-                            f"Ground Truth\n[{v_true_i.min().item():.2f}, {v_true_i.max().item():.2f}]"
-                        )
-                        axes[i, 0].axis("off")
-                        axes[i, 1].imshow(
-                            v_pred_np,
-                            cmap="inferno",
-                            vmin=-v_vis_abs,
-                            vmax=v_vis_abs,
-                            interpolation="nearest",
-                        )
-                        axes[i, 1].set_title(
-                            f"Prediction\n[{v_pred_i.min().item():.2f}, {v_pred_i.max().item():.2f}]"
-                        )
-                        axes[i, 1].axis("off")
-                        v_err = (v_pred_i - v_true_i).abs()
-                        err_vmax = max(1.0e-6, float(v_err.max().item()))
-                        axes[i, 2].imshow(
-                            v_err.detach().cpu().numpy(),
-                            cmap="magma",
-                            vmin=0.0,
-                            vmax=err_vmax,
-                            interpolation="nearest",
-                        )
-                        axes[i, 2].set_title(f"Abs Error {v_err.mean().item():.4f}")
-                        axes[i, 2].axis("off")
-                        if sublattice_resolved:
-                            axes[i, 3].imshow(g_val_agg[i, k0].cpu().numpy(), cmap="viridis")
-                            axes[i, 3].set_title(f"LDOS Agg E{k0}")
-                        else:
-                            axes[i, 3].imshow(g_val[i, k0].cpu().numpy(), cmap="viridis")
-                            axes[i, 3].set_title(f"LDOS E{k0}")
-                        axes[i, 3].axis("off")
-                        if sublattice_resolved:
-                            axes[i, 4].imshow(g_val[i, k1, 0].cpu().numpy(), cmap="viridis")
-                            axes[i, 4].set_title(f"LDOS A E{k1}")
-                        else:
-                            axes[i, 4].imshow(g_val[i, k1].cpu().numpy(), cmap="viridis")
-                            axes[i, 4].set_title(f"LDOS E{k1}")
-                        axes[i, 4].axis("off")
-                        if sublattice_resolved:
-                            axes[i, 5].imshow(g_val[i, k1, 1].cpu().numpy(), cmap="viridis")
-                            axes[i, 5].set_title(f"LDOS B E{k1}")
-                        else:
-                            axes[i, 5].imshow(g_val[i, k2].cpu().numpy(), cmap="viridis")
-                            axes[i, 5].set_title(f"LDOS E{k2}")
-                        axes[i, 5].axis("off")
-                        
                     save_path = os.path.join(config["paths"]["workdir"], "images", f"val_step_{next_step}.png")
-                    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-                    plt.tight_layout()
-                    plt.savefig(save_path)
-                    plt.close()
+                    defect_meta_vis = None
+                    if isinstance(defect_meta_val, dict):
+                        defect_meta_vis = {}
+                        for k, v in defect_meta_val.items():
+                            if torch.is_tensor(v):
+                                defect_meta_vis[k] = v[:n_val]
+                    render_diffusion_comparison_grid(
+                        V_true=V_true[:n_val],
+                        V_pred=V_pred[:n_val],
+                        g_obs=g_val[:n_val],
+                        defect_meta=defect_meta_vis,
+                        save_path=save_path,
+                        title_prefix="Validation",
+                        show_shared_compare=True,
+                    )
                     print(f"Validation images saved to {save_path}")
                 except Exception as e:
                     print(f"Validation failed: {e}")

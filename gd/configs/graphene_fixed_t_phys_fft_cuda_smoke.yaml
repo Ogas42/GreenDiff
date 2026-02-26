@@ -2,13 +2,13 @@
   name: GreenDiff
   seed: 42
   device: cuda
-  precision: fp32
+  precision: bf16
   compile: false
   cudnn_benchmark: false
 paths:
   workdir: gd/runs
   runs_root: gd/runs
-  dataset_root: data_cache
+  dataset_root: gd/data_cache_fft_cuda_smoke
 
 data:
   resolution: 64
@@ -39,17 +39,17 @@ data:
     scale: 100000.0
     cache_scaled: true
   return_physics_meta: false
-  num_samples_total: 100
-  cache_shard_size: 32
-  num_workers: 0
-  shard_workers: 0
-  pin_memory: false
-  persistent_workers: false
+  num_samples_total: 2000
+  cache_shard_size: 64
+  num_workers: 6
+  shard_workers: 4
+  pin_memory: true
+  persistent_workers: true
   prefetch_factor: 2
 
 potential_sampler:
   family: mixed
-  normalize: true
+  normalize: false
   structural:
     enabled: true
     family: mixed
@@ -143,10 +143,11 @@ vae:
     lr: 1.0e-4
     weight_decay: 0.0
     grad_clip: 1.0
-    max_steps: 10
-    log_every: 1
-    ckpt_every: 10
-    val_every: 10
+    max_steps: 500
+    log_every: 25
+    show_progress_bar: false
+    ckpt_every: 250
+    val_every: 250
 
 latent_green:
   enabled: true
@@ -164,22 +165,32 @@ latent_green:
     use_timestep: true
     time_embed_dim: 128
     time_embed_freq: 128
-    use_fft_loss: false
-    fft_loss_weight: 0.0
-    stats_loss_weight: 0.0
+    use_fft_loss: true
+    fft_loss_weight: 0.35
+    stats_loss_weight: 0.02
     linear_scale_loss_weight: 0.0
-    multiscale_loss_weight: 0.0
+    multiscale_loss_weight: 0.05
     multiscale_scales: [2, 4]
     loss_type: huber
     huber_beta: 0.1
-    psd_loss_weight: 0.0
+    psd_loss_weight: 0.10
     psd_eps: 1.0e-8
     per_energy_affine: false
     energy_align:
       enabled: false
       max_shift: 0
     log_cosh_eps: 1.0e-6
-    aux_warmup_steps: 0
+    aux_warmup_steps: 100
+    peak_control:
+      enabled: true
+      log_aux_weight: 0.10
+      log_aux_huber_beta: 0.1
+      log_aux_scale: p95_obs_per_sample
+      topk_loss_weight: 0.20
+      topk_frac: 0.005
+      topk_huber_beta: 0.1
+      peak_ratio_penalty_weight: 0.05
+      peak_ratio_cap: 4.0
     residual_loss_weight: 1.0
     physics_losses:
       data_weight: 1.0
@@ -200,18 +211,19 @@ latent_green:
     lr: 1.0e-4
     weight_decay: 0.0
     grad_clip: 1.0
-    max_steps: 10
-    log_every: 1
-    ckpt_every: 10
+    max_steps: 1000
+    log_every: 25
+    show_progress_bar: false
+    ckpt_every: 250
     debug_fixed_batch: false
     surrogate_check:
       enabled: false
       rel_l2_max: 0.3
-      warmup_steps: 0
+      warmup_steps: 100
     lr_schedule:
-      enabled: false
+      enabled: true
       type: cosine
-      warmup_steps: 0
+      warmup_steps: 50
       min_lr_ratio: 0.1
       warmup_min_ratio: 0.1
 
@@ -243,15 +255,18 @@ diffusion:
     lr: 1.0e-4
     weight_decay: 0.0
     grad_clip: 1.0
-    max_steps: 10
-    log_every: 1
+    max_steps: 2000
+    log_every: 50
     log_smooth_window: 5
-    ckpt_every: 10
-    val_every: 10
+    show_progress_bar: false
+    ckpt_every: 500
+    val_every: 500
     vis_fixed_n: 2
     prediction_type: eps
-    x0_loss_weight: 0.0
-    phys_loss_weight: 0.0
+    inverse_target: v_only
+    allow_unclosed_inverse: true
+    x0_loss_weight: 0.10
+    phys_loss_weight: 0.05
     phys_loss_type: mse
     huber_beta: 0.1
     psd_loss_weight: 0.0
@@ -261,22 +276,37 @@ diffusion:
       enabled: false
       max_shift: 0
     phys_warmup:
-      enabled: false
-      warmup_steps: 0
+      enabled: true
+      warmup_steps: 500
       start_ratio: 0.0
       end_ratio: 1.0
     energy_weights: []
     energy_weight_mode: uniform
     energy_weight_eps: 1.0e-6
     energy_weight_power: 1.0
-    consistency_loss_weight: 0.0
+    consistency_loss_weight: 0.02
+    phys_supervision:
+      enabled: true
+      domain: linear_normalized
+      monitor_when_disabled: true
+      normalize_per_sample_rms: true
+      consistency_on_normalized_linear: true
+    phys_gate:
+      enabled: true
+      mode: require_green_metrics
+      allow_override: false
+      green_metrics_path: auto_latest
+      rel_l2_max: 0.60
+      peak_ratio_max: 5.0
+      mean_ratio_min: 0.70
+      mean_ratio_max: 1.30
     topk_phys:
       enabled: false
       k: 0
     lr_schedule:
-      enabled: false
+      enabled: true
       type: cosine
-      warmup_steps: 0
+      warmup_steps: 200
       min_lr_ratio: 0.1
       warmup_min_ratio: 0.1
     latent_scale:
@@ -291,7 +321,7 @@ diffusion:
       enabled: false
       decay: 0.9999
   sampler:
-    steps: 50
+    steps: 10
     eta: 0.0
 
 guidance:
@@ -344,9 +374,9 @@ student:
     lr: 1.0e-4
     weight_decay: 0.0
     grad_clip: 1.0
-    max_steps: 10
-    log_every: 1
-    ckpt_every: 10
+    max_steps: 50
+    log_every: 25
+    ckpt_every: 50
 
 eval:
   save_samples: false

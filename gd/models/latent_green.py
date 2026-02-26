@@ -344,6 +344,9 @@ class LatentGreen(nn.Module):
             data_loss = _reduce_data_loss(pred, obs)
         elif data_loss_domain == "obs_legacy":
             g_pred_for_loss = ldos_obs_from_linear(g_pred, self.data_cfg)
+            pred_lin_c = g_obs_to_canonical_view(g_pred, self.data_cfg) if self.sublattice_resolved_ldos else g_pred.unsqueeze(2)
+            obs_lin_raw = ldos_linear_from_obs(g_obs, self.data_cfg)
+            obs_lin_c = obs_lin_raw if self.sublattice_resolved_ldos else obs_lin_raw.unsqueeze(2)
             if self.sublattice_resolved_ldos:
                 pred_canonical = g_obs_to_canonical_view(g_pred_for_loss, self.data_cfg)
                 pred = flatten_sub_for_energy_ops(pred_canonical)
@@ -365,6 +368,52 @@ class LatentGreen(nn.Module):
             data_loss = per_energy_loss.mean()
         else:
             raise ValueError(f"Unsupported latent_green.model.data_loss_domain={data_loss_domain!r}")
+        peak_cfg = self.model_cfg.get("peak_control", {})
+        if not isinstance(peak_cfg, dict):
+            peak_cfg = {}
+        peak_enabled = bool(peak_cfg.get("enabled", False))
+        log_aux_loss = torch.zeros((), device=g_pred.device)
+        topk_peak_loss = torch.zeros((), device=g_pred.device)
+        peak_ratio_penalty = torch.zeros((), device=g_pred.device)
+        if peak_enabled:
+            pred_lin_pos = pred_lin_c.clamp_min(0)
+            obs_lin_pos = obs_lin_c.clamp_min(0)
+            bsz = pred_lin_pos.shape[0]
+            pred_flat = pred_lin_pos.reshape(bsz, -1)
+            obs_flat = obs_lin_pos.reshape(bsz, -1)
+            peak_eps = 1.0e-6
+
+            # Dynamic-range-compressed auxiliary loss to reduce peak over-shoot.
+            log_aux_beta = float(peak_cfg.get("log_aux_huber_beta", 0.1))
+            log_scale_mode = str(peak_cfg.get("log_aux_scale", "p95_obs_per_sample"))
+            if log_scale_mode == "p95_obs_per_sample":
+                scale = torch.quantile(obs_flat, 0.95, dim=1, keepdim=True)
+            else:
+                scale = obs_flat.mean(dim=1, keepdim=True)
+            scale = scale.clamp_min(peak_eps)
+            pred_log = torch.log1p(pred_flat / scale)
+            obs_log = torch.log1p(obs_flat / scale)
+            log_aux_loss = F.smooth_l1_loss(pred_log, obs_log, beta=log_aux_beta)
+
+            # Peak-aware supervision on GT top-k and predicted top-k locations.
+            topk_frac = float(peak_cfg.get("topk_frac", 0.005))
+            topk_beta = float(peak_cfg.get("topk_huber_beta", 0.1))
+            n = pred_flat.shape[1]
+            k = max(1, min(n, int(math.ceil(topk_frac * n))))
+            idx_obs = torch.topk(obs_flat, k, dim=1).indices
+            idx_pred = torch.topk(pred_flat, k, dim=1).indices
+            gather_pred_on_obs = torch.gather(pred_flat, 1, idx_obs)
+            gather_obs_on_obs = torch.gather(obs_flat, 1, idx_obs)
+            gather_pred_on_pred = torch.gather(pred_flat, 1, idx_pred)
+            gather_obs_on_pred = torch.gather(obs_flat, 1, idx_pred)
+            topk_gt = F.smooth_l1_loss(gather_pred_on_obs, gather_obs_on_obs, beta=topk_beta)
+            topk_pred = F.smooth_l1_loss(gather_pred_on_pred, gather_obs_on_pred, beta=topk_beta)
+            topk_peak_loss = topk_gt + 0.5 * topk_pred
+
+            # Hard-ish penalty for pathological max-ratio explosion.
+            peak_cap = float(peak_cfg.get("peak_ratio_cap", 4.0))
+            peak_ratio = pred_flat.max(dim=1).values / obs_flat.max(dim=1).values.clamp_min(peak_eps)
+            peak_ratio_penalty = F.relu(peak_ratio - peak_cap).pow(2).mean()
         if self.model_cfg["use_fft_loss"]:
             fft_loss = self._fft_loss(pred, obs)
             weight = self.model_cfg["fft_loss_weight"]
@@ -450,6 +499,9 @@ class LatentGreen(nn.Module):
             "residual_loss": residual_loss,
             "sum_rule_loss": sum_rule_loss,
             "nonneg_loss": nonneg_loss,
+            "log_aux_loss": log_aux_loss,
+            "topk_peak_loss": topk_peak_loss,
+            "peak_ratio_penalty": peak_ratio_penalty,
             "data_loss_domain": data_loss_domain,
         }
 

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import glob
+import json
 import os
+import sys
 import time
 from collections import deque
 from typing import Any, Dict
@@ -44,9 +47,134 @@ class DiffusionTrainer(StageTrainer):
     stage_name = "diffusion"
     requires = ["vae", "green"]
 
+    @staticmethod
+    def _cfg_bool(value: Any, default: bool = False) -> bool:
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            s = value.strip().lower()
+            if s in {"1", "true", "yes", "y", "on"}:
+                return True
+            if s in {"0", "false", "no", "n", "off"}:
+                return False
+        return bool(value)
+
+    @classmethod
+    def _validate_inverse_target_cfg(cls, cfg: Dict[str, Any], train_cfg: Dict[str, Any]) -> None:
+        inverse_target = str(train_cfg.get("inverse_target", "v_only")).lower()
+        allow_unclosed = cls._cfg_bool(train_cfg.get("allow_unclosed_inverse", False), default=False)
+        structural_cfg = cfg.get("potential_sampler", {}).get("structural", {})
+        structural_enabled = bool(structural_cfg.get("enabled", False)) if isinstance(structural_cfg, dict) else False
+        if inverse_target == "v_only" and structural_enabled and not allow_unclosed:
+            raise ValueError(
+                "Diffusion inverse target is 'v_only' but potential_sampler.structural.enabled=true. "
+                "This makes the inverse task unclosed because LDOS depends on V + structural defects. "
+                "Set potential_sampler.structural.enabled=false for V-only diffusion, "
+                "or set diffusion.training.allow_unclosed_inverse=true to override for experiments."
+            )
+
+    @staticmethod
+    def _find_green_metrics_file(cfg: Dict[str, Any], gate_cfg: Dict[str, Any]) -> str | None:
+        path_cfg = gate_cfg.get("green_metrics_path", "auto_latest")
+        if isinstance(path_cfg, str) and path_cfg and path_cfg != "auto_latest":
+            return path_cfg if os.path.isfile(path_cfg) else None
+        workdir = cfg.get("paths", {}).get("workdir", "")
+        runs_root = cfg.get("paths", {}).get("runs_root", "")
+        candidates = []
+        if workdir:
+            candidates.append(os.path.join(workdir, "metrics", "green_eval_val.json"))
+            candidates.extend(glob.glob(os.path.join(workdir, "metrics", "*green_eval*.json")))
+        if runs_root and os.path.isdir(runs_root):
+            candidates.extend(glob.glob(os.path.join(runs_root, "**", "green_eval_val.json"), recursive=True))
+        existing = [p for p in candidates if os.path.isfile(p)]
+        if not existing:
+            return None
+        existing.sort(key=lambda p: os.path.getmtime(p), reverse=True)
+        return existing[0]
+
+    @classmethod
+    def _resolve_phys_gate_state(cls, cfg: Dict[str, Any], train_cfg: Dict[str, Any], *, is_main: bool) -> Dict[str, Any]:
+        gate_cfg = train_cfg.get("phys_gate", {})
+        if not isinstance(gate_cfg, dict):
+            gate_cfg = {}
+        enabled = cls._cfg_bool(gate_cfg.get("enabled", False), default=False)
+        state: Dict[str, Any] = {
+            "enabled": enabled,
+            "passed": True,
+            "reason": None,
+            "metrics_path": None,
+            "metrics": None,
+        }
+        if not enabled:
+            return state
+
+        allow_override = cls._cfg_bool(gate_cfg.get("allow_override", False), default=False)
+        path = cls._find_green_metrics_file(cfg, gate_cfg)
+        state["metrics_path"] = path
+        if path is None:
+            state["passed"] = bool(allow_override)
+            state["reason"] = "green_metrics_missing" if not state["passed"] else "green_metrics_missing_override"
+            return state
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                payload = json.load(f)
+            metrics = payload.get("metrics", payload if isinstance(payload, dict) else {})
+            if not isinstance(metrics, dict):
+                metrics = {}
+            state["metrics"] = metrics
+        except Exception as exc:
+            state["passed"] = bool(allow_override)
+            state["reason"] = f"green_metrics_read_error:{type(exc).__name__}"
+            return state
+
+        def _pick(*keys):
+            for k in keys:
+                v = state["metrics"].get(k) if isinstance(state["metrics"], dict) else None
+                if v is not None:
+                    try:
+                        return float(v)
+                    except Exception:
+                        return None
+            return None
+
+        rel = _pick("rel_l2", "rel_phys_mean", "rel_l2_mean")
+        peak = _pick("peak_ratio_mean", "pred_obs_max_ratio_mean", "peak_ratio")
+        mean_ratio = _pick("pred_obs_mean_ratio_mean", "mean_ratio_mean", "mean_ratio")
+        state["metrics_compact"] = {"rel_l2": rel, "peak_ratio_mean": peak, "mean_ratio": mean_ratio}
+        if rel is None or peak is None or mean_ratio is None:
+            state["passed"] = bool(allow_override)
+            state["reason"] = "green_metrics_missing_required_keys" if not state["passed"] else "override_missing_keys"
+            return state
+
+        rel_max = float(gate_cfg.get("rel_l2_max", 0.60))
+        peak_max = float(gate_cfg.get("peak_ratio_max", 5.0))
+        mean_min = float(gate_cfg.get("mean_ratio_min", 0.70))
+        mean_max = float(gate_cfg.get("mean_ratio_max", 1.30))
+        passed = (rel <= rel_max) and (peak <= peak_max) and (mean_min <= mean_ratio <= mean_max)
+        if not passed and allow_override:
+            passed = True
+            state["reason"] = "override_thresholds_failed"
+        elif not passed:
+            state["reason"] = f"green_gate_fail(rel={rel:.3f},peak={peak:.3f},mean={mean_ratio:.3f})"
+        else:
+            state["reason"] = "green_gate_pass"
+        state["passed"] = passed
+        if is_main:
+            print(
+                f"[gd.diffusion_trainer] phys_gate enabled={enabled} passed={state['passed']} "
+                f"reason={state['reason']} metrics_path={path}"
+            )
+        return state
+
     def build(self, ctx: Any, cfg: Dict[str, Any]) -> Dict[str, Any]:
         force_linear_ldos_mode(cfg, verbose=ctx.dist.is_main, context="gd.diffusion_trainer")
         train_cfg = cfg["diffusion"]["training"]
+        self._validate_inverse_target_cfg(cfg, train_cfg)
+        phys_gate_state = self._resolve_phys_gate_state(cfg, train_cfg, is_main=ctx.dist.is_main)
         device = torch.device(ctx.dist.device)
         dataset, sampler, loader = build_train_dataloader(cfg, train_cfg, ctx.dist, split="train")
         ckpt_mgr = CheckpointManager(cfg["paths"]["runs_root"], cfg["paths"]["checkpoints"])
@@ -79,6 +207,7 @@ class DiffusionTrainer(StageTrainer):
             "ckpt_mgr": ckpt_mgr,
             "train_metrics_jsonl": train_metrics_jsonl,
             "images_dir": images_dir,
+            "phys_gate_state": phys_gate_state,
             "last_ckpt": None,
             "last_ema_ckpt": None,
         }
@@ -128,11 +257,21 @@ class DiffusionTrainer(StageTrainer):
         ema_decay = components.get("ema_decay")
         ckpt_mgr: CheckpointManager = components["ckpt_mgr"]
         amp = ctx.amp
+        phys_gate_state = components.get("phys_gate_state")
 
         max_steps = int(train_cfg["max_steps"])
         log_every = int(train_cfg["log_every"])
         grad_clip = float(train_cfg.get("grad_clip", 0.0))
         ckpt_every = int(train_cfg.get("ckpt_every", 2000))
+        show_progress_bar = self._cfg_bool(train_cfg.get("show_progress_bar", False), default=False)
+        if not sys.stderr.isatty():
+            # Non-interactive log collectors often print a new line for every tqdm refresh.
+            show_progress_bar = False
+        if ctx.dist.is_main:
+            print(
+                f"[gd.diffusion_trainer] show_progress_bar={show_progress_bar} "
+                f"(cfg={train_cfg.get('show_progress_bar', None)!r}, stderr_tty={sys.stderr.isatty()})"
+            )
         step = int(resume_state.step)
         start_step = step
 
@@ -140,7 +279,11 @@ class DiffusionTrainer(StageTrainer):
         prediction_type = str(train_cfg.get("prediction_type", "eps"))
 
         tqdm = get_tqdm()
-        pbar = tqdm(total=max_steps, initial=step, desc="Training Diffusion", dynamic_ncols=True) if ctx.dist.is_main else None
+        pbar = (
+            tqdm(total=max_steps, initial=step, desc="Training Diffusion", dynamic_ncols=True)
+            if (ctx.dist.is_main and show_progress_bar)
+            else None
+        )
         smooth_window = int(train_cfg.get("log_smooth_window", 50))
         histories = {
             "loss": deque(maxlen=max(1, smooth_window)),
@@ -178,6 +321,7 @@ class DiffusionTrainer(StageTrainer):
                     step=step,
                     amp=amp,
                     sample=sample,
+                    phys_gate_state=phys_gate_state,
                 )
                 diffusion_train_step(
                     model=model,

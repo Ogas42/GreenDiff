@@ -46,3 +46,23 @@ def test_structural_defect_sampler_can_emit_missing_bonds():
     sampler = StructuralDefectSampler(scfg)
     out = sampler.sample_graphene(6, 6, seed=7)
     assert (out["bond_mod"] == -1.0).any()
+
+
+def test_sublattice_selective_is_spatially_varying_and_ab_opposite():
+    scfg = {
+        "enabled": True,
+        "family": "sublattice_selective",
+        "sublattice_selective": {
+            "amplitude_range": [0.2, 0.2],
+            "mode": "ab_opposite",
+            "correlation_frac_range": [0.15, 0.15],
+            "localized_envelope_prob": 1.0,
+            "localized_quantile": 0.5,
+        },
+    }
+    sampler = StructuralDefectSampler(scfg)
+    out = sampler.sample_graphene(24, 24, seed=11)
+    a = out["onsite_ab_delta"][0]
+    b = out["onsite_ab_delta"][1]
+    assert float(a.std().item()) > 1.0e-4
+    assert float((a + b).abs().max().item()) < 1.0e-5

@@ -2,13 +2,13 @@
   name: GreenDiff
   seed: 42
   device: cuda
-  precision: fp32
+  precision: bf16
   compile: false
   cudnn_benchmark: false
 paths:
   workdir: gd/runs
   runs_root: gd/runs
-  dataset_root: data_cache
+  dataset_root: gd/data_cache_vonly_cuda_smoke
 
 data:
   resolution: 64
@@ -39,19 +39,19 @@ data:
     scale: 100000.0
     cache_scaled: true
   return_physics_meta: false
-  num_samples_total: 100
-  cache_shard_size: 32
-  num_workers: 0
-  shard_workers: 0
-  pin_memory: false
-  persistent_workers: false
+  num_samples_total: 2000
+  cache_shard_size: 64
+  num_workers: 6
+  shard_workers: 4
+  pin_memory: true
+  persistent_workers: true
   prefetch_factor: 2
 
 potential_sampler:
   family: mixed
-  normalize: true
+  normalize: false
   structural:
-    enabled: true
+    enabled: false
     family: mixed
     mixed:
       weights:
@@ -72,11 +72,30 @@ potential_sampler:
       mode: ab_opposite
   mixed:
     weights:
-      point_impurity: 1.0
+      correlated_noise: 0.85
+      clustered: 0.05
+      point_impurity: 0.10
+      domain_wall: 0.00
   point_impurity:
-    num_points_range: [1, 4]
-    amplitude_range: [-1.0, 1.0]
-    blob_sigma_range: [0.0, 1.0]
+    num_points_range: [4, 12]
+    amplitude_range: [-0.35, 0.35]
+    blob_sigma_range: [1.5, 4.0]
+  clustered:
+    num_clusters_range: [1, 2]
+    radius_range: [2.0, 5.0]
+    amplitude_range: [-0.30, 0.30]
+  correlated_noise:
+    corr_length_range: [6.0, 18.0]
+    amplitude_range: [-0.85, 0.85]
+    mode: multiscale
+    octaves: [1, 2, 4]
+    octave_amplitude_power: 1.0
+    global_bias_range: [0.0, 0.0]
+  domain_wall:
+    num_regions_range: [2, 3]
+    amplitude_range: [-0.20, 0.20]
+    smooth_boundary: true
+    boundary_smooth_sigma: 2.0
 
 physics:
   backend: kwant
@@ -143,10 +162,11 @@ vae:
     lr: 1.0e-4
     weight_decay: 0.0
     grad_clip: 1.0
-    max_steps: 10
-    log_every: 1
-    ckpt_every: 10
-    val_every: 10
+    max_steps: 500
+    log_every: 25
+    show_progress_bar: false
+    ckpt_every: 250
+    val_every: 250
 
 latent_green:
   enabled: true
@@ -164,22 +184,32 @@ latent_green:
     use_timestep: true
     time_embed_dim: 128
     time_embed_freq: 128
-    use_fft_loss: false
-    fft_loss_weight: 0.0
-    stats_loss_weight: 0.0
+    use_fft_loss: true
+    fft_loss_weight: 0.35
+    stats_loss_weight: 0.02
     linear_scale_loss_weight: 0.0
-    multiscale_loss_weight: 0.0
+    multiscale_loss_weight: 0.05
     multiscale_scales: [2, 4]
     loss_type: huber
     huber_beta: 0.1
-    psd_loss_weight: 0.0
+    psd_loss_weight: 0.10
     psd_eps: 1.0e-8
     per_energy_affine: false
     energy_align:
       enabled: false
       max_shift: 0
     log_cosh_eps: 1.0e-6
-    aux_warmup_steps: 0
+    aux_warmup_steps: 100
+    peak_control:
+      enabled: true
+      log_aux_weight: 0.10
+      log_aux_huber_beta: 0.1
+      log_aux_scale: p95_obs_per_sample
+      topk_loss_weight: 0.20
+      topk_frac: 0.005
+      topk_huber_beta: 0.1
+      peak_ratio_penalty_weight: 0.05
+      peak_ratio_cap: 4.0
     residual_loss_weight: 1.0
     physics_losses:
       data_weight: 1.0
@@ -200,18 +230,19 @@ latent_green:
     lr: 1.0e-4
     weight_decay: 0.0
     grad_clip: 1.0
-    max_steps: 10
-    log_every: 1
-    ckpt_every: 10
+    max_steps: 1000
+    log_every: 25
+    show_progress_bar: false
+    ckpt_every: 250
     debug_fixed_batch: false
     surrogate_check:
       enabled: false
       rel_l2_max: 0.3
-      warmup_steps: 0
+      warmup_steps: 100
     lr_schedule:
-      enabled: false
+      enabled: true
       type: cosine
-      warmup_steps: 0
+      warmup_steps: 50
       min_lr_ratio: 0.1
       warmup_min_ratio: 0.1
 
@@ -243,14 +274,17 @@ diffusion:
     lr: 1.0e-4
     weight_decay: 0.0
     grad_clip: 1.0
-    max_steps: 10
-    log_every: 1
+    max_steps: 2000
+    log_every: 50
     log_smooth_window: 5
-    ckpt_every: 10
-    val_every: 10
+    show_progress_bar: false
+    ckpt_every: 500
+    val_every: 500
     vis_fixed_n: 2
     prediction_type: eps
-    x0_loss_weight: 0.0
+    inverse_target: v_only
+    allow_unclosed_inverse: false
+    x0_loss_weight: 0.05
     phys_loss_weight: 0.0
     phys_loss_type: mse
     huber_beta: 0.1
@@ -261,8 +295,8 @@ diffusion:
       enabled: false
       max_shift: 0
     phys_warmup:
-      enabled: false
-      warmup_steps: 0
+      enabled: true
+      warmup_steps: 500
       start_ratio: 0.0
       end_ratio: 1.0
     energy_weights: []
@@ -274,9 +308,9 @@ diffusion:
       enabled: false
       k: 0
     lr_schedule:
-      enabled: false
+      enabled: true
       type: cosine
-      warmup_steps: 0
+      warmup_steps: 200
       min_lr_ratio: 0.1
       warmup_min_ratio: 0.1
     latent_scale:
@@ -290,8 +324,23 @@ diffusion:
     ema:
       enabled: false
       decay: 0.9999
+    phys_supervision:
+      enabled: true
+      domain: linear_normalized
+      monitor_when_disabled: true
+      normalize_per_sample_rms: true
+      consistency_on_normalized_linear: true
+    phys_gate:
+      enabled: true
+      mode: require_green_metrics
+      allow_override: false
+      green_metrics_path: auto_latest
+      rel_l2_max: 0.60
+      peak_ratio_max: 5.0
+      mean_ratio_min: 0.70
+      mean_ratio_max: 1.30
   sampler:
-    steps: 50
+    steps: 10
     eta: 0.0
 
 guidance:
@@ -344,9 +393,9 @@ student:
     lr: 1.0e-4
     weight_decay: 0.0
     grad_clip: 1.0
-    max_steps: 10
-    log_every: 1
-    ckpt_every: 10
+    max_steps: 50
+    log_every: 25
+    ckpt_every: 50
 
 eval:
   save_samples: false

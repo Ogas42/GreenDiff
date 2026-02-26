@@ -90,15 +90,49 @@ class PotentialSampler:
             mask = ((xs - cy) ** 2 + (ys - cx) ** 2) <= radius**2
             V = V + amp * mask.float()
         return V
-
     def _correlated_noise(self, H: int, W: int, gen: torch.Generator) -> torch.Tensor:
-        """生成具有空间相关性的随机势能 (模拟背景无序)"""
+        """Generate spatially correlated disorder (single-scale or multiscale puddles)."""
         if self.corr_cfg is None:
             raise KeyError("potential_sampler.correlated_noise config is required for family 'correlated_noise'")
         sigma_min, sigma_max = self.corr_cfg["corr_length_range"]
         amp_min, amp_max = self.corr_cfg["amplitude_range"]
-        corr_length = sigma_min + (sigma_max - sigma_min) * torch.rand(1, generator=gen).item()
-        sigma = 1.0 / corr_length
+        amp = amp_min + (amp_max - amp_min) * torch.rand(1, generator=gen).item()
+        mode = str(self.corr_cfg.get("mode", "single_scale"))
+
+        if mode == "single_scale":
+            corr_length = sigma_min + (sigma_max - sigma_min) * torch.rand(1, generator=gen).item()
+            return self._correlated_noise_single_field(H, W, gen, corr_length) * amp
+
+        if mode != "multiscale":
+            raise ValueError(f"Unknown potential_sampler.correlated_noise.mode: {mode}")
+
+        base_corr_length = sigma_min + (sigma_max - sigma_min) * torch.rand(1, generator=gen).item()
+        octaves_cfg = self.corr_cfg.get("octaves", [1, 2, 4])
+        if not isinstance(octaves_cfg, (list, tuple)) or len(octaves_cfg) == 0:
+            octaves_cfg = [1, 2, 4]
+        octaves = [max(1.0, float(o)) for o in octaves_cfg]
+        power = float(self.corr_cfg.get("octave_amplitude_power", 1.0))
+
+        field = torch.zeros(H, W, dtype=torch.float32)
+        weight_sum = 0.0
+        for octave in octaves:
+            corr_length = max(1.0e-3, float(base_corr_length) / octave)
+            w = 1.0 / (octave ** power) if power != 0.0 else 1.0
+            field = field + float(w) * self._correlated_noise_single_field(H, W, gen, corr_length)
+            weight_sum += float(w)
+        if weight_sum > 0.0:
+            field = field / weight_sum
+
+        field = field - field.mean()
+        field = field / field.std().clamp_min(1.0e-6)
+        gb_min, gb_max = self.corr_cfg.get("global_bias_range", [0.0, 0.0])
+        if float(gb_min) != 0.0 or float(gb_max) != 0.0:
+            bias = float(gb_min) + (float(gb_max) - float(gb_min)) * torch.rand(1, generator=gen).item()
+            field = field + float(bias)
+        return field * amp
+
+    def _correlated_noise_single_field(self, H: int, W: int, gen: torch.Generator, corr_length: float) -> torch.Tensor:
+        sigma = 1.0 / max(1.0e-6, float(corr_length))
         noise = torch.randn(H, W, generator=gen)
         fy = torch.fft.fftfreq(H)
         fx = torch.fft.rfftfreq(W)
@@ -106,9 +140,10 @@ class PotentialSampler:
         radius2 = kx**2 + ky**2
         filt = torch.exp(-radius2 / (2.0 * sigma**2))
         spectrum = torch.fft.rfft2(noise)
-        filtered = torch.fft.irfft2(spectrum * filt, s=(H, W))
-        amp = amp_min + (amp_max - amp_min) * torch.rand(1, generator=gen).item()
-        return filtered * amp
+        filtered = torch.fft.irfft2(spectrum * filt, s=(H, W)).to(torch.float32)
+        filtered = filtered - filtered.mean()
+        filtered = filtered / filtered.std().clamp_min(1.0e-6)
+        return filtered
 
     def _domain_wall(self, H: int, W: int, gen: torch.Generator) -> torch.Tensor:
         """生成畴壁势能 (模拟材料中的晶界或相位分离)"""

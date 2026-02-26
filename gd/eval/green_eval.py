@@ -59,6 +59,19 @@ def _summarize_metrics(metrics: Dict[str, list[float]]) -> Dict[str, Optional[fl
     summary["rel_l2"] = summary.get("rel_phys_mean")
     summary["psd_error"] = summary.get("psd_error_mean")
     summary["residual"] = summary.get("residual_mean")
+    peak_vals = metrics.get("peak_ratio", [])
+    if peak_vals:
+        arr = np.asarray(peak_vals, dtype=np.float64)
+        summary["peak_ratio_p95"] = float(np.quantile(arr, 0.95))
+        summary["peak_ratio_p99"] = float(np.quantile(arr, 0.99))
+    else:
+        summary["peak_ratio_p95"] = None
+        summary["peak_ratio_p99"] = None
+    summary["peak_ratio_mean"] = summary.get("peak_ratio_mean")
+    summary["pred_obs_max_ratio_mean"] = summary.get("pred_obs_max_ratio_mean")
+    summary["pred_obs_mean_ratio_mean"] = summary.get("pred_obs_mean_ratio_mean", summary.get("mean_ratio_mean"))
+    summary["pred_p99_over_obs_p99"] = summary.get("pred_p99_over_obs_p99_mean")
+    summary["pred_std_over_obs_std"] = summary.get("pred_std_over_obs_std_mean")
     return summary
 
 
@@ -171,6 +184,11 @@ def run(
         "rel_phys_scaled": [],
         "scale_factor": [],
         "mean_ratio": [],
+        "peak_ratio": [],
+        "pred_obs_max_ratio": [],
+        "pred_obs_mean_ratio": [],
+        "pred_p99_over_obs_p99": [],
+        "pred_std_over_obs_std": [],
         "psd_error": [],
         "residual": [],
         "hopping_mean": [],
@@ -278,6 +296,22 @@ def run(
 
             mean_ratio = pred_lin_raw.mean(dim=(1, 2, 3)) / obs_lin_raw.mean(dim=(1, 2, 3)).clamp_min(1.0e-6)
             metrics["mean_ratio"].append(float(mean_ratio.mean().item()))
+            metrics["pred_obs_mean_ratio"].extend([float(v) for v in mean_ratio.detach().cpu().tolist()])
+
+            pred_max = pred_lin_raw.amax(dim=(1, 2, 3))
+            obs_max = obs_lin_raw.amax(dim=(1, 2, 3)).clamp_min(1.0e-6)
+            peak_ratio = pred_max / obs_max
+            metrics["peak_ratio"].extend([float(v) for v in peak_ratio.detach().cpu().tolist()])
+            metrics["pred_obs_max_ratio"].extend([float(v) for v in peak_ratio.detach().cpu().tolist()])
+
+            pred_flat_q = pred_lin_raw.reshape(pred_lin_raw.shape[0], -1)
+            obs_flat_q = obs_lin_raw.reshape(obs_lin_raw.shape[0], -1)
+            pred_p99 = torch.quantile(pred_flat_q, 0.99, dim=1)
+            obs_p99 = torch.quantile(obs_flat_q, 0.99, dim=1).clamp_min(1.0e-6)
+            p99_ratio = pred_p99 / obs_p99
+            metrics["pred_p99_over_obs_p99"].extend([float(v) for v in p99_ratio.detach().cpu().tolist()])
+            pred_std_ratio = pred_lin_raw.std(dim=(1, 2, 3)) / obs_lin_raw.std(dim=(1, 2, 3)).clamp_min(1.0e-6)
+            metrics["pred_std_over_obs_std"].extend([float(v) for v in pred_std_ratio.detach().cpu().tolist()])
 
             pred_fft = torch.fft.rfft2(pred_lin_raw, norm="ortho")
             obs_fft = torch.fft.rfft2(obs_lin_raw, norm="ortho")

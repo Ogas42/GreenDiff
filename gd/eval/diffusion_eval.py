@@ -167,6 +167,7 @@ def run(
         if V_true.dim() == 3:
             V_true = V_true.unsqueeze(1)
         g_obs = batch["g_obs"].to(device)
+        defect_meta = batch.get("defect_meta") if isinstance(batch, dict) else None
 
         with torch.no_grad():
             _z_tmp, latent_meta = prepare_latent_batch(vae=vae, V=V_true, train_cfg=cfg["diffusion"]["training"])
@@ -183,10 +184,17 @@ def run(
         if vis_n and idx == 0:
             try:
                 save_path = os.path.join(images_dir, f"diffusion_eval_{split}.png")
+                defect_meta_vis = None
+                if isinstance(defect_meta, dict):
+                    defect_meta_vis = {
+                        k: (v[:vis_n] if torch.is_tensor(v) and v.dim() >= 1 else v)
+                        for k, v in defect_meta.items()
+                    }
                 vis_path = render_diffusion_comparison_grid(
                     V_true=V_true[:vis_n],
                     V_pred=V_pred[:vis_n],
                     g_obs=g_obs[:vis_n],
+                    defect_meta=defect_meta_vis,
                     save_path=save_path,
                     title_prefix="Diffusion Eval",
                 )

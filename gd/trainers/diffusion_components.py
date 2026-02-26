@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 
 from gd.core.logging.results import append_train_metric_jsonl
-from gd.utils.ldos_transform import ldos_obs_from_linear
+from gd.utils.ldos_transform import ldos_linear_from_obs, ldos_obs_from_linear
 from gd.utils.loss_align import align_pred, per_energy_affine
 from gd.utils.obs_layout import flatten_sub_for_energy_ops, g_obs_to_canonical_view, is_sublattice_resolved
 
@@ -184,6 +184,17 @@ def _energy_weights_from_obs(
     return None
 
 
+def _rms_normalize_pair(
+    pred: torch.Tensor,
+    obs: torch.Tensor,
+    *,
+    eps: float = 1.0e-6,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    reduce_dims = tuple(range(1, obs.dim()))
+    scale = torch.sqrt((obs**2).mean(dim=reduce_dims, keepdim=True) + eps).clamp_min(eps)
+    return pred / scale, obs / scale, scale
+
+
 def compute_physics_terms(
     *,
     x0_pred: torch.Tensor,
@@ -192,6 +203,7 @@ def compute_physics_terms(
     alpha_t: torch.Tensor,
     train_cfg: Dict[str, Any],
     data_cfg: Dict[str, Any],
+    compute_consistency: bool,
 ) -> Dict[str, Any]:
     device = x0_pred.device
     t_zeros = torch.zeros((x0_pred.shape[0],), dtype=torch.long, device=device)
@@ -216,31 +228,74 @@ def compute_physics_terms(
     energy_weight_eps = float(train_cfg.get("energy_weight_eps", 1.0e-6))
     energy_weight_power = float(train_cfg.get("energy_weight_power", 1.0))
 
+    phys_sup_cfg = train_cfg.get("phys_supervision", {})
+    if not isinstance(phys_sup_cfg, dict):
+        phys_sup_cfg = {}
+    phys_sup_enabled = bool(phys_sup_cfg.get("enabled", True))
+    phys_domain = str(phys_sup_cfg.get("domain", "linear_normalized" if phys_sup_enabled else "obs_legacy")).lower()
+    normalize_rms = bool(phys_sup_cfg.get("normalize_per_sample_rms", True))
+    consistency_on_normalized = bool(phys_sup_cfg.get("consistency_on_normalized_linear", True))
+
     sublattice_resolved = bool(is_sublattice_resolved(data_cfg))
-    g_pred_phys = latent_green(x0_pred, t_zeros)
-    g_pred_phys_for_loss = ldos_obs_from_linear(g_pred_phys, data_cfg)
-    if sublattice_resolved:
-        g_pred_phys_for_loss = g_obs_to_canonical_view(g_pred_phys_for_loss, data_cfg)
-    pred_eval = g_pred_phys_for_loss
-    obs_eval = g_obs
-    if use_per_energy_affine:
-        pred_eval = per_energy_affine(pred_eval, obs_eval)
-    pred_eval, per_energy_loss = align_pred(
-        pred_eval,
-        obs_eval,
-        enabled=align_enabled,
-        max_shift=align_max_shift,
-        loss_type=phys_loss_type,
-        huber_beta=huber_beta,
-        log_cosh_eps=log_cosh_eps,
-    )
+    g_pred_lin_model = latent_green(x0_pred, t_zeros)
+
+    if phys_domain == "linear_normalized":
+        pred_eval = g_obs_to_canonical_view(g_pred_lin_model, data_cfg) if sublattice_resolved else g_pred_lin_model
+        obs_lin = ldos_linear_from_obs(g_obs, data_cfg)
+        obs_eval = obs_lin if sublattice_resolved else obs_lin
+        if not sublattice_resolved:
+            # keep shapes 4D for downstream loss helpers and energy weighting
+            pred_eval = pred_eval
+            obs_eval = obs_eval
+        if normalize_rms:
+            pred_eval, obs_eval, _scale = _rms_normalize_pair(pred_eval, obs_eval, eps=1.0e-6)
+        if use_per_energy_affine:
+            pred_eval = per_energy_affine(pred_eval, obs_eval)
+        pred_eval, per_energy_loss = align_pred(
+            pred_eval,
+            obs_eval,
+            enabled=align_enabled,
+            max_shift=align_max_shift,
+            loss_type=phys_loss_type,
+            huber_beta=huber_beta,
+            log_cosh_eps=log_cosh_eps,
+        )
+        obs_for_energy_weight = obs_eval
+        pred_for_psd = pred_eval
+        obs_for_psd = obs_eval
+        compute_consistency_here = compute_consistency and consistency_on_normalized
+        raw_phys_loss_obs_domain = None
+    else:
+        g_pred_phys_for_loss = ldos_obs_from_linear(g_pred_lin_model, data_cfg)
+        if sublattice_resolved:
+            g_pred_phys_for_loss = g_obs_to_canonical_view(g_pred_phys_for_loss, data_cfg)
+        pred_eval = g_pred_phys_for_loss
+        obs_eval = g_obs
+        if use_per_energy_affine:
+            pred_eval = per_energy_affine(pred_eval, obs_eval)
+        pred_eval, per_energy_loss = align_pred(
+            pred_eval,
+            obs_eval,
+            enabled=align_enabled,
+            max_shift=align_max_shift,
+            loss_type=phys_loss_type,
+            huber_beta=huber_beta,
+            log_cosh_eps=log_cosh_eps,
+        )
+        obs_for_energy_weight = obs_eval
+        pred_for_psd = pred_eval
+        obs_for_psd = obs_eval
+        compute_consistency_here = compute_consistency
+        raw_phys_loss_obs_domain = None
 
     if len(energy_weights) == g_obs.shape[1]:
         w = torch.tensor(energy_weights, device=device, dtype=per_energy_loss.dtype)
         w = _normalize_energy_weights(w, eps=energy_weight_eps, power=energy_weight_power).view(1, -1)
         per_energy_loss = per_energy_loss * w
     else:
-        w_dyn = _energy_weights_from_obs(obs_eval, mode=energy_weight_mode, eps=energy_weight_eps, power=energy_weight_power)
+        w_dyn = _energy_weights_from_obs(
+            obs_for_energy_weight, mode=energy_weight_mode, eps=energy_weight_eps, power=energy_weight_power
+        )
         if w_dyn is not None:
             per_energy_loss = per_energy_loss * w_dyn.view(1, -1)
 
@@ -254,14 +309,14 @@ def compute_physics_terms(
     phys_loss = (phys_loss_per_sample * phys_sample_weight).mean()
     psd_loss = None
     if psd_loss_weight > 0:
-        psd_per_sample = _psd_loss_per_sample(pred_eval, obs_eval, psd_eps=psd_eps)
+        psd_per_sample = _psd_loss_per_sample(pred_for_psd, obs_for_psd, psd_eps=psd_eps)
         psd_loss = (psd_per_sample * phys_sample_weight).mean()
 
     consistency_loss = None
     raw_consistency_loss = None
-    if consistency_loss_weight > 0:
+    if compute_consistency_here:
         pred_diff = pred_eval[:, 1:] - pred_eval[:, :-1]
-        obs_diff = g_obs[:, 1:] - g_obs[:, :-1]
+        obs_diff = obs_eval[:, 1:] - obs_eval[:, :-1]
         const_map = F.mse_loss(pred_diff, obs_diff, reduction="none")
         const_per_sample = const_map.mean(dim=tuple(range(1, const_map.dim())))
         consistency_loss = (const_per_sample * phys_sample_weight).mean()
@@ -280,7 +335,9 @@ def compute_physics_terms(
         "consistency_loss": consistency_loss,
         "raw_phys_loss": float(phys_loss_per_sample.mean().item()),
         "raw_consistency_loss": raw_consistency_loss,
+        "raw_phys_loss_obs_domain": raw_phys_loss_obs_domain,
         "pred_for_consistency": pred_eval,
+        "phys_eval_domain": phys_domain,
     }
 
 
@@ -297,13 +354,30 @@ def compute_total_diffusion_loss(
     step: int,
     amp: Any,
     sample: Dict[str, torch.Tensor],
+    phys_gate_state: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     prediction_type = str(train_cfg.get("prediction_type", "eps"))
     x0_loss_weight = float(train_cfg.get("x0_loss_weight", 0.0))
-    phys_loss_weight = float(train_cfg.get("phys_loss_weight", 0.0))
+    phys_loss_weight_cfg = float(train_cfg.get("phys_loss_weight", 0.0))
     phys_warmup_cfg = train_cfg.get("phys_warmup", {})
     psd_loss_weight = float(train_cfg.get("psd_loss_weight", 0.0))
-    consistency_loss_weight = float(train_cfg.get("consistency_loss_weight", 0.0) or 0.0)
+    consistency_loss_weight_cfg = float(train_cfg.get("consistency_loss_weight", 0.0) or 0.0)
+    phys_sup_cfg = train_cfg.get("phys_supervision", {})
+    if not isinstance(phys_sup_cfg, dict):
+        phys_sup_cfg = {}
+    monitor_when_disabled = bool(phys_sup_cfg.get("monitor_when_disabled", True))
+    log_every = int(train_cfg.get("log_every", 1) or 1)
+    should_monitor_phys = bool(monitor_when_disabled and (step % max(1, log_every) == 0))
+
+    gate_enabled = bool((phys_gate_state or {}).get("enabled", False))
+    gate_passed = bool((phys_gate_state or {}).get("passed", True))
+    if gate_enabled and not gate_passed:
+        phys_loss_weight = 0.0
+        consistency_loss_weight = 0.0
+    else:
+        phys_loss_weight = phys_loss_weight_cfg
+        consistency_loss_weight = consistency_loss_weight_cfg
+    phys_gate_reason = (phys_gate_state or {}).get("reason")
 
     device_type = "cuda" if z.device.type == "cuda" else "cpu"
     with torch.amp.autocast(device_type, enabled=bool(amp.use_amp), dtype=amp.amp_dtype):
@@ -323,7 +397,8 @@ def compute_total_diffusion_loss(
         x0_pred = None
         x0_loss = None
         raw_x0_loss = None
-        if x0_loss_weight > 0 or phys_loss_weight > 0:
+        need_phys_terms = phys_loss_weight > 0 or should_monitor_phys
+        if x0_loss_weight > 0 or need_phys_terms:
             x0_pred = compute_x0_pred(
                 prediction_type=prediction_type,
                 z_t=sample["z_t"],
@@ -332,20 +407,25 @@ def compute_total_diffusion_loss(
                 sigma_t=sample["sigma_t"],
             )
 
-        if x0_loss_weight > 0 and x0_pred is not None:
+        if x0_pred is not None:
             x0_loss_per_sample = F.mse_loss(x0_pred, z, reduction="none").mean(dim=(1, 2, 3))
             x0_sample_weight = sample["alpha_t"].view(-1) ** 2
             x0_loss = (x0_loss_per_sample * x0_sample_weight).mean()
-            total_loss = total_loss + x0_loss_weight * x0_loss
             raw_x0_loss = float(F.mse_loss(x0_pred, z).item())
+            if x0_loss_weight > 0:
+                total_loss = total_loss + x0_loss_weight * x0_loss
 
         phys_loss = None
         psd_loss = None
         consistency_loss = None
         raw_phys_loss = None
         raw_consistency_loss = None
-        phys_coeff = None
-        if phys_loss_weight > 0 and x0_pred is not None:
+        raw_phys_loss_obs_domain = None
+        phys_eval_domain = None
+        phys_coeff = 0.0
+        phys_loss_weight_eff = phys_loss_weight
+        consistency_loss_weight_eff = consistency_loss_weight
+        if x0_pred is not None and (phys_loss_weight > 0 or should_monitor_phys):
             phys_terms = compute_physics_terms(
                 x0_pred=x0_pred,
                 latent_green=latent_green,
@@ -353,28 +433,32 @@ def compute_total_diffusion_loss(
                 alpha_t=sample["alpha_t"],
                 train_cfg=train_cfg,
                 data_cfg=data_cfg,
+                compute_consistency=(consistency_loss_weight > 0 or should_monitor_phys),
             )
             phys_loss = phys_terms["phys_loss"]
             psd_loss = phys_terms["psd_loss"]
             consistency_loss = phys_terms["consistency_loss"]
             raw_phys_loss = phys_terms["raw_phys_loss"]
             raw_consistency_loss = phys_terms["raw_consistency_loss"]
+            raw_phys_loss_obs_domain = phys_terms.get("raw_phys_loss_obs_domain")
+            phys_eval_domain = phys_terms.get("phys_eval_domain")
 
-            total_phys = phys_loss
-            if psd_loss is not None and psd_loss_weight > 0:
-                total_phys = total_phys + psd_loss_weight * psd_loss
+            if phys_loss_weight > 0:
+                total_phys = phys_loss
+                if psd_loss is not None and psd_loss_weight > 0:
+                    total_phys = total_phys + psd_loss_weight * psd_loss
 
-            phys_coeff = phys_loss_weight
-            if bool(phys_warmup_cfg.get("enabled", False)) and int(phys_warmup_cfg.get("warmup_steps", 0)) > 0:
-                warmup_steps = int(phys_warmup_cfg.get("warmup_steps", 0))
-                start_ratio = float(phys_warmup_cfg.get("start_ratio", 1.0))
-                end_ratio = float(phys_warmup_cfg.get("end_ratio", 1.0))
-                ramp = min(float(step + 1) / float(max(1, warmup_steps)), 1.0)
-                phys_coeff = phys_loss_weight * (start_ratio + (end_ratio - start_ratio) * ramp)
+                phys_coeff = phys_loss_weight
+                if bool(phys_warmup_cfg.get("enabled", False)) and int(phys_warmup_cfg.get("warmup_steps", 0)) > 0:
+                    warmup_steps = int(phys_warmup_cfg.get("warmup_steps", 0))
+                    start_ratio = float(phys_warmup_cfg.get("start_ratio", 1.0))
+                    end_ratio = float(phys_warmup_cfg.get("end_ratio", 1.0))
+                    ramp = min(float(step + 1) / float(max(1, warmup_steps)), 1.0)
+                    phys_coeff = phys_loss_weight * (start_ratio + (end_ratio - start_ratio) * ramp)
 
-            total_loss = total_loss + phys_coeff * total_phys
-            if consistency_loss is not None and consistency_loss_weight > 0:
-                total_loss = total_loss + consistency_loss_weight * consistency_loss
+                total_loss = total_loss + phys_coeff * total_phys
+                if consistency_loss is not None and consistency_loss_weight > 0:
+                    total_loss = total_loss + consistency_loss_weight * consistency_loss
 
     return {
         "loss": total_loss,
@@ -390,7 +474,16 @@ def compute_total_diffusion_loss(
         "raw_x0_loss": raw_x0_loss,
         "raw_phys_loss": raw_phys_loss,
         "raw_consistency_loss": raw_consistency_loss,
+        "raw_phys_loss_norm": raw_phys_loss,
+        "raw_consistency_loss_norm": raw_consistency_loss,
+        "raw_phys_loss_obs_domain": raw_phys_loss_obs_domain,
+        "phys_eval_domain": phys_eval_domain,
         "phys_coeff": phys_coeff,
+        "phys_loss_weight_eff": phys_loss_weight_eff,
+        "consistency_loss_weight_eff": consistency_loss_weight_eff,
+        "phys_gate_enabled": gate_enabled,
+        "phys_gate_passed": gate_passed,
+        "phys_gate_reason": phys_gate_reason,
     }
 
 
@@ -452,8 +545,8 @@ def log_diffusion_train_status(
     histories["loss"].append(float(loss_pack["loss"].detach().item()))
     histories["base"].append(float(loss_pack["base_loss"].detach().item()))
     histories["x0"].append(loss_pack["raw_x0_loss"])
-    histories["phys"].append(loss_pack["raw_phys_loss"])
-    histories["cons"].append(loss_pack["raw_consistency_loss"])
+    histories["phys"].append(loss_pack.get("raw_phys_loss_norm", loss_pack.get("raw_phys_loss")))
+    histories["cons"].append(loss_pack.get("raw_consistency_loss_norm", loss_pack.get("raw_consistency_loss")))
     histories["phys_coeff"].append(loss_pack["phys_coeff"])
 
     def _avg(name: str):
@@ -466,15 +559,18 @@ def log_diffusion_train_status(
     loss_val = float(loss_pack["loss"].detach().item())
     base_val = float(loss_pack["base_loss"].detach().item())
     x0_raw = loss_pack["raw_x0_loss"]
-    phys_raw = loss_pack["raw_phys_loss"]
-    cons_raw = loss_pack["raw_consistency_loss"]
+    phys_raw = loss_pack.get("raw_phys_loss_norm", loss_pack.get("raw_phys_loss"))
+    cons_raw = loss_pack.get("raw_consistency_loss_norm", loss_pack.get("raw_consistency_loss"))
     snr = loss_pack["snr"]
+    gate_tag = ""
+    if loss_pack.get("phys_gate_enabled", False):
+        gate_tag = " gate=on" if bool(loss_pack.get("phys_gate_passed", False)) else " gate=off"
     summary = (
         f"[diff] step={step} loss={loss_val:.6f} base={base_val:.6f} "
         f"x0={x0_raw if x0_raw is not None else 'na'} phys={phys_raw if phys_raw is not None else 'na'} "
         f"cons={cons_raw if cons_raw is not None else 'na'} lr={lr:.2e} "
         f"snr={float(snr.mean().item()):.2f}/{float(snr.min().item()):.2f}/{float(snr.max().item()):.2f} "
-        f"w={float(loss_pack.get('weight_mean', 1.0)):.3f} it/s={it_s:.2f} s/s={samples_s:.0f}"
+        f"w={float(loss_pack.get('weight_mean', 1.0)):.3f} it/s={it_s:.2f} s/s={samples_s:.0f}{gate_tag}"
     )
     avg_msg = (
         f"[diff-avg] loss={_avg('loss')} base={_avg('base')} x0={_avg('x0')} "
@@ -513,9 +609,18 @@ def append_diffusion_train_metric_jsonl(
         "raw_x0_loss": loss_pack.get("raw_x0_loss"),
         "raw_phys_loss": loss_pack.get("raw_phys_loss"),
         "raw_consistency_loss": loss_pack.get("raw_consistency_loss"),
+        "raw_phys_loss_norm": loss_pack.get("raw_phys_loss_norm", loss_pack.get("raw_phys_loss")),
+        "raw_consistency_loss_norm": loss_pack.get("raw_consistency_loss_norm", loss_pack.get("raw_consistency_loss")),
+        "raw_phys_loss_obs_domain": loss_pack.get("raw_phys_loss_obs_domain"),
+        "phys_eval_domain": loss_pack.get("phys_eval_domain"),
         "snr_mean": float(loss_pack["snr"].mean().item()),
         "weight_mean": float(loss_pack.get("weight_mean", 1.0)),
         "phys_coeff": loss_pack.get("phys_coeff"),
+        "phys_loss_weight_eff": loss_pack.get("phys_loss_weight_eff"),
+        "consistency_loss_weight_eff": loss_pack.get("consistency_loss_weight_eff"),
+        "phys_gate_enabled": loss_pack.get("phys_gate_enabled"),
+        "phys_gate_passed": loss_pack.get("phys_gate_passed"),
+        "phys_gate_reason": loss_pack.get("phys_gate_reason"),
         "lr": float(opt.param_groups[0]["lr"]) if opt.param_groups else None,
     }
     return append_train_metric_jsonl(rec, path)
