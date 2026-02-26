@@ -267,6 +267,13 @@ def train_latent_green(config: Dict[str, Any]):
             psd_weight = model_cfg.get("psd_loss_weight", 0.0)
             linear_scale_weight = model_cfg.get("linear_scale_loss_weight", 0.0)
             ms_weight = model_cfg.get("multiscale_loss_weight", 0.0)
+            peak_cfg = model_cfg.get("peak_control", {})
+            if not isinstance(peak_cfg, dict):
+                peak_cfg = {}
+            peak_enabled = bool(peak_cfg.get("enabled", False))
+            peak_log_w = float(peak_cfg.get("log_aux_weight", 0.0)) if peak_enabled else 0.0
+            peak_topk_w = float(peak_cfg.get("topk_loss_weight", 0.0)) if peak_enabled else 0.0
+            peak_ratio_w = float(peak_cfg.get("peak_ratio_penalty_weight", 0.0)) if peak_enabled else 0.0
             phy_w = _green_physics_weights(model_cfg)
             total_loss = phy_w["data_weight"] * losses["data_loss"]
             total_loss = total_loss + aux_scale * fft_weight * losses["fft_loss"]
@@ -274,6 +281,9 @@ def train_latent_green(config: Dict[str, Any]):
             total_loss = total_loss + aux_scale * stats_weight * losses["stats_loss"]
             total_loss = total_loss + linear_scale_weight * losses["linear_scale_loss"]
             total_loss = total_loss + aux_scale * ms_weight * losses["ms_loss"]
+            total_loss = total_loss + aux_scale * peak_log_w * losses.get("log_aux_loss", torch.zeros_like(losses["data_loss"]))
+            total_loss = total_loss + aux_scale * peak_topk_w * losses.get("topk_peak_loss", torch.zeros_like(losses["data_loss"]))
+            total_loss = total_loss + aux_scale * peak_ratio_w * losses.get("peak_ratio_penalty", torch.zeros_like(losses["data_loss"]))
             total_loss = total_loss + phy_w["residual_weight"] * losses["residual_loss"]
             total_loss = total_loss + phy_w["sum_rule_weight"] * losses.get("sum_rule_loss", torch.zeros_like(losses["data_loss"]))
             total_loss = total_loss + phy_w["nonneg_weight"] * losses.get("nonneg_loss", torch.zeros_like(losses["data_loss"]))

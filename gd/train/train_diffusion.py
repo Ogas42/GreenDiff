@@ -3,6 +3,7 @@ import math
 import os
 import glob
 import copy
+import sys
 import torch.optim as optim
 from collections import deque
 import torch.nn.functional as F
@@ -52,7 +53,24 @@ def train_diffusion(config: Dict[str, Any]):
     is_main = (not is_distributed) or rank == 0
     force_linear_ldos_mode(config, verbose=is_main, context="train_diffusion")
     train_cfg = config["diffusion"]["training"]
-    show_progress_bar = bool(train_cfg.get("show_progress_bar", True))
+    def _cfg_bool(value, default=True):
+        if value is None:
+            return default
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            s = value.strip().lower()
+            if s in {"1", "true", "yes", "y", "on"}:
+                return True
+            if s in {"0", "false", "no", "n", "off"}:
+                return False
+        return bool(value)
+
+    show_progress_bar = _cfg_bool(train_cfg.get("show_progress_bar", True), default=True)
+    if not sys.stderr.isatty():
+        show_progress_bar = False
     energy_weights_cfg = train_cfg.get("energy_weights", [])
     if isinstance(energy_weights_cfg, (list, tuple)):
         energy_weights = list(energy_weights_cfg)
@@ -551,7 +569,8 @@ def train_diffusion(config: Dict[str, Any]):
                     "snr": f"{snr_mean:.2f}",
                     "const": const_avg_str,
                 }
-                pbar.set_postfix(postfix)
+                if pbar is not None:
+                    pbar.set_postfix(postfix)
                 print(f"[stats] step={step} bs={z.shape[0]} loss={loss.item():.6f} lr={current_lr:.2e} x0_raw={x0_raw_str} x0_w={x0_w_str} phys={phys_str} const={const_step_str} phys_w={phys_coeff_str}")
                 print(f"[avg] loss={loss_avg:.6f} x0_raw={x0_avg_str} phys={phys_avg_str} const={const_avg_str} phys_w={phys_coeff_avg_str}")
                 print(f"[stats] z={z_mean:.4f}/{z_std:.4f} snr={snr_mean:.2f}/{snr_min:.2f}/{snr_max:.2f} w={weight_mean:.3f}")
