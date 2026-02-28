@@ -2,6 +2,7 @@
 import glob
 import math
 import time
+import sys
 from typing import Dict, Any
 from collections import deque
 import torch
@@ -25,6 +26,22 @@ try:
 except ImportError:
     def tqdm(iterable, **kwargs):
         return iterable
+
+
+def _cfg_bool(value, default=True):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in {"1", "true", "yes", "y", "on"}:
+            return True
+        if s in {"0", "false", "no", "n", "off"}:
+            return False
+    return bool(value)
 
 
 def _to_device_tree(x, device, non_blocking: bool = True):
@@ -203,7 +220,14 @@ def train_latent_green(config: Dict[str, Any]):
             return min_lr_ratio + (1.0 - min_lr_ratio) * cosine
         scheduler = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda=lr_lambda)
 
-    pbar = tqdm(total=max_steps, initial=step, desc="Training Latent Green", dynamic_ncols=True) if is_main else None
+    show_progress_bar = _cfg_bool(data_cfg.get("show_progress_bar", True), default=True)
+    if not sys.stderr.isatty():
+        show_progress_bar = False
+    pbar = (
+        tqdm(total=max_steps, initial=step, desc="Training Latent Green", dynamic_ncols=True)
+        if (is_main and show_progress_bar)
+        else None
+    )
     smooth_window = int(data_cfg.get("log_smooth_window", 50))
     loss_hist = deque(maxlen=max(1, smooth_window))
     data_hist = deque(maxlen=max(1, smooth_window))
@@ -331,12 +355,14 @@ def train_latent_green(config: Dict[str, Any]):
                         )
                         g_obs_obs_flat = flatten_sub_for_energy_ops(g_obs)
                         g_pred_lin_flat = flatten_sub_for_energy_ops(g_obs_to_canonical_view(g_pred, common_data_cfg))
-                        g_obs_lin_flat = flatten_sub_for_energy_ops(ldos_linear_from_obs(g_obs, common_data_cfg))
+                        g_obs_lin_flat = flatten_sub_for_energy_ops(
+                            ldos_linear_from_obs(g_obs, common_data_cfg).clamp_min(0.0)
+                        )
                     else:
                         g_pred_obs_flat = ldos_obs_from_linear(g_pred, common_data_cfg)
                         g_obs_obs_flat = g_obs
                         g_pred_lin_flat = g_pred
-                        g_obs_lin_flat = ldos_linear_from_obs(g_obs, common_data_cfg)
+                        g_obs_lin_flat = ldos_linear_from_obs(g_obs, common_data_cfg).clamp_min(0.0)
 
                     if log_enabled:
                         g_pred_log = g_pred_obs_flat
@@ -383,8 +409,10 @@ def train_latent_green(config: Dict[str, Any]):
                         rel_l2 = torch.norm(g_pred_obs - g_obs_obs) / torch.norm(g_obs_obs).clamp_min(1.0e-6)
                         pred_min = g_pred_obs.min().item()
                         pred_max = g_pred_obs.max().item()
+                        pred_p99 = torch.quantile(g_pred_obs.reshape(g_pred_obs.shape[0], -1), 0.99, dim=1).mean().item()
                         obs_min = g_obs_obs.min().item()
                         obs_max = g_obs_obs.max().item()
+                        obs_p99 = torch.quantile(g_obs_obs.reshape(g_obs_obs.shape[0], -1), 0.99, dim=1).mean().item()
                         g_pred_lin = g_pred_lin_flat
                         g_obs_lin = g_obs_lin_flat
                         pred_mean_log = None
@@ -488,14 +516,20 @@ def train_latent_green(config: Dict[str, Any]):
                             f"Pred Lin mean/std [{g_pred_lin.mean().item():.3f}, {g_pred_lin.std().item():.3f}] | "
                             f"Obs Lin mean/std [{g_obs_lin.mean().item():.3f}, {g_obs_lin.std().item():.3f}]"
                         )
+                        tail_msg = (
+                            f"Step {step}: "
+                            f"Pred/Obs p99 [{pred_p99:.3f}, {obs_p99:.3f}]"
+                        )
                         if pbar is not None:
                             pbar.write(summary)
                             pbar.write(msg)
                             pbar.write(stats_msg)
+                            pbar.write(tail_msg)
                         elif is_main:
                             print(summary)
                             print(msg)
                             print(stats_msg)
+                            print(tail_msg)
 
                 elif pbar is not None:
                     pbar.write(summary)

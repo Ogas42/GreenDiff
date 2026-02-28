@@ -85,6 +85,170 @@ class ResBlock(nn.Module):
         return x + h
 
 
+def _group_norm_groups(channels: int) -> int:
+    groups = min(8, max(1, int(channels)))
+    while groups > 1 and channels % groups != 0:
+        groups -= 1
+    return groups
+
+
+def _make_feature_norm(channels: int, norm_type: str) -> nn.Module:
+    norm = str(norm_type).lower()
+    if norm == "identity":
+        return nn.Identity()
+    if norm == "groupnorm":
+        return nn.GroupNorm(_group_norm_groups(channels), channels)
+    raise ValueError(f"Unsupported LatentGreen norm_type={norm_type!r}; expected 'groupnorm' or 'identity'.")
+
+
+def _apply_feature_modulation(
+    h: torch.Tensor,
+    t_emb: Optional[torch.Tensor],
+    time_proj: Optional[nn.Module],
+    cond_emb: Optional[torch.Tensor],
+    cond_proj: Optional[nn.Module],
+) -> torch.Tensor:
+    if time_proj is not None and t_emb is not None:
+        h = h + time_proj(t_emb).unsqueeze(-1).unsqueeze(-1)
+    if cond_proj is not None and cond_emb is not None:
+        scale, shift = cond_proj(cond_emb).chunk(2, dim=-1)
+        h = h * (1.0 + scale.unsqueeze(-1).unsqueeze(-1)) + shift.unsqueeze(-1).unsqueeze(-1)
+    return h
+
+
+class SpectralConv2d(nn.Module):
+    def __init__(self, in_channels: int, out_channels: int, modes_x: int, modes_y: int):
+        super().__init__()
+        self.in_channels = int(in_channels)
+        self.out_channels = int(out_channels)
+        self.modes_x = max(1, int(modes_x))
+        self.modes_y = max(1, int(modes_y))
+        self.weight_real = nn.Parameter(
+            torch.empty(self.in_channels, self.out_channels, self.modes_x, self.modes_y)
+        )
+        self.weight_imag = nn.Parameter(
+            torch.empty(self.in_channels, self.out_channels, self.modes_x, self.modes_y)
+        )
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        scale = 1.0 / math.sqrt(max(1, self.in_channels + self.out_channels))
+        nn.init.uniform_(self.weight_real, -scale, scale)
+        nn.init.uniform_(self.weight_imag, -scale, scale)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        orig_dtype = x.dtype
+        x_ft = torch.fft.rfft2(x.to(torch.float32), dim=(-2, -1), norm="ortho")
+        out_ft = x_ft.new_zeros((x.shape[0], self.out_channels, x_ft.shape[-2], x_ft.shape[-1]))
+        mx = min(self.modes_x, x_ft.shape[-2], self.weight_real.shape[-2])
+        my = min(self.modes_y, x_ft.shape[-1], self.weight_real.shape[-1])
+        if mx > 0 and my > 0:
+            x_sub = x_ft[:, :, :mx, :my]
+            xr = x_sub.real
+            xi = x_sub.imag
+            wr = self.weight_real[:, :, :mx, :my]
+            wi = self.weight_imag[:, :, :mx, :my]
+            out_real = torch.einsum("bixy,ioxy->boxy", xr, wr) - torch.einsum("bixy,ioxy->boxy", xi, wi)
+            out_imag = torch.einsum("bixy,ioxy->boxy", xr, wi) + torch.einsum("bixy,ioxy->boxy", xi, wr)
+            out_ft[:, :, :mx, :my] = torch.complex(out_real, out_imag)
+        out = torch.fft.irfft2(out_ft, s=x.shape[-2:], dim=(-2, -1), norm="ortho")
+        return out.to(orig_dtype)
+
+
+class FNOBlock2d(nn.Module):
+    def __init__(
+        self,
+        channels: int,
+        modes_x: int,
+        modes_y: int,
+        time_embed_dim: Optional[int] = None,
+        cond_embed_dim: Optional[int] = None,
+        pointwise_skip: bool = True,
+        norm_type: str = "groupnorm",
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.spectral = SpectralConv2d(channels, channels, modes_x, modes_y)
+        self.pointwise = nn.Conv2d(channels, channels, kernel_size=1) if pointwise_skip else None
+        self.time_proj = None
+        if time_embed_dim is not None:
+            self.time_proj = nn.Sequential(nn.SiLU(), nn.Linear(time_embed_dim, channels))
+        self.cond_proj = None
+        if cond_embed_dim is not None:
+            self.cond_proj = nn.Sequential(nn.SiLU(), nn.Linear(cond_embed_dim, channels * 2))
+        self.norm = _make_feature_norm(channels, norm_type)
+        self.act = nn.GELU()
+        self.dropout = nn.Dropout2d(dropout)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        t_emb: Optional[torch.Tensor] = None,
+        cond_emb: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        h = self.spectral(x)
+        if self.pointwise is not None:
+            h = h + self.pointwise(x)
+        h = _apply_feature_modulation(h, t_emb, self.time_proj, cond_emb, self.cond_proj)
+        h = self.norm(h)
+        h = self.dropout(self.act(h))
+        return x + h
+
+
+class HybridFNOBlock2d(nn.Module):
+    def __init__(
+        self,
+        channels: int,
+        modes_x: int,
+        modes_y: int,
+        local_branch_channels: int,
+        local_branch_depth: int,
+        time_embed_dim: Optional[int] = None,
+        cond_embed_dim: Optional[int] = None,
+        pointwise_skip: bool = True,
+        norm_type: str = "groupnorm",
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.spectral = SpectralConv2d(channels, channels, modes_x, modes_y)
+        self.pointwise = nn.Conv2d(channels, channels, kernel_size=1) if pointwise_skip else None
+        local_layers = []
+        local_hidden = int(local_branch_channels)
+        local_depth = max(1, int(local_branch_depth))
+        in_channels = channels
+        for idx in range(local_depth):
+            out_channels = channels if idx == local_depth - 1 else local_hidden
+            local_layers.append(nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1))
+            if idx != local_depth - 1:
+                local_layers.append(nn.GELU())
+            in_channels = local_hidden
+        self.local_branch = nn.Sequential(*local_layers)
+        self.time_proj = None
+        if time_embed_dim is not None:
+            self.time_proj = nn.Sequential(nn.SiLU(), nn.Linear(time_embed_dim, channels))
+        self.cond_proj = None
+        if cond_embed_dim is not None:
+            self.cond_proj = nn.Sequential(nn.SiLU(), nn.Linear(cond_embed_dim, channels * 2))
+        self.norm = _make_feature_norm(channels, norm_type)
+        self.act = nn.GELU()
+        self.dropout = nn.Dropout2d(dropout)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        t_emb: Optional[torch.Tensor] = None,
+        cond_emb: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        h = self.spectral(x)
+        if self.pointwise is not None:
+            h = h + self.pointwise(x)
+        h = h + self.local_branch(x)
+        h = _apply_feature_modulation(h, t_emb, self.time_proj, cond_emb, self.cond_proj)
+        h = self.norm(h)
+        h = self.dropout(self.act(h))
+        return x + h
+
+
 class LatentGreen(nn.Module):
     """
     Latent Green operator mapping z to g_pred.
@@ -110,12 +274,30 @@ class LatentGreen(nn.Module):
         self.K = self.data_cfg["K"]
         self.sublattice_resolved_ldos = bool(is_sublattice_resolved(self.data_cfg))
         self.obs_channels = int(obs_channel_count(self.data_cfg))
-        self.base_channels = self.model_cfg["base_channels"]
-        self.num_res_blocks = self.model_cfg["num_res_blocks"]
-        self.dropout = self.model_cfg["dropout"]
+        self.base_channels = int(self.model_cfg["base_channels"])
+        self.backbone_type = str(self.model_cfg.get("backbone", "cnn")).lower()
+        if self.backbone_type not in ("cnn", "fno", "hybrid_fno"):
+            raise ValueError(
+                f"Unsupported latent_green.model.backbone={self.backbone_type!r}; "
+                "expected one of {'cnn', 'fno', 'hybrid_fno'}."
+            )
+        self.hidden_channels = int(self.model_cfg.get("hidden_channels", self.base_channels))
+        self.num_res_blocks = int(self.model_cfg["num_res_blocks"])
+        self.dropout = float(self.model_cfg["dropout"])
+        feature_default_channels = self.base_channels if self.backbone_type == "cnn" else self.hidden_channels
         self.use_timestep = self.model_cfg.get("use_timestep", True)
-        self.time_embed_dim = self.model_cfg.get("time_embed_dim", self.base_channels * 4)
-        self.time_embed_freq = self.model_cfg.get("time_embed_freq", 256)
+        self.time_embed_dim = int(self.model_cfg.get("time_embed_dim", feature_default_channels * 4))
+        self.time_embed_freq = int(self.model_cfg.get("time_embed_freq", 256))
+        self.fno_layers = max(1, int(self.model_cfg.get("fno_layers", 4)))
+        self.fno_modes_x = max(1, int(self.model_cfg.get("fno_modes_x", 12)))
+        self.fno_modes_y = max(1, int(self.model_cfg.get("fno_modes_y", 12)))
+        self.use_coord_grid = bool(self.model_cfg.get("use_coord_grid", True)) and self.backbone_type in ("fno", "hybrid_fno")
+        self.coord_channels = 2 if self.use_coord_grid else 0
+        self.spectral_dropout = float(self.model_cfg.get("spectral_dropout", self.dropout))
+        self.pointwise_skip = bool(self.model_cfg.get("pointwise_skip", True))
+        self.norm_type = str(self.model_cfg.get("norm_type", "groupnorm")).lower()
+        self.local_branch_channels = int(self.model_cfg.get("local_branch_channels", self.hidden_channels))
+        self.local_branch_depth = max(1, int(self.model_cfg.get("local_branch_depth", 2)))
         self.eta = float(self.physics_cfg["kpm"].get("eta", 0.01))
         ham_cfg = self.physics_cfg["hamiltonian"]
         self.lattice_type = str(ham_cfg.get("type", "square_lattice")).lower()
@@ -131,7 +313,7 @@ class LatentGreen(nn.Module):
         self.mu = float(ham_cfg.get("mu", 0.0))
         self.use_physics_meta_conditioning = bool(self.cond_cfg.get("use_physics_meta", False))
         self.cond_scalar_keys = list(self.cond_cfg.get("scalar_keys", ["hopping"]))
-        self.cond_embed_dim = int(self.cond_cfg.get("embed_dim", max(16, self.base_channels)))
+        self.cond_embed_dim = int(self.cond_cfg.get("embed_dim", max(16, feature_default_channels)))
         self.cond_inject_mode = str(self.cond_cfg.get("inject_mode", "film"))
         if self.cond_inject_mode != "film":
             raise ValueError(f"Unsupported latent_green.conditioning.inject_mode={self.cond_inject_mode!r}; expected 'film'.")
@@ -163,10 +345,30 @@ class LatentGreen(nn.Module):
             energies = torch.tensor(energies_cfg["list"], dtype=torch.float32)
         self.register_buffer("energies", energies)
 
-        self.in_proj = nn.Conv2d(self.latent_channels, self.base_channels, kernel_size=3, padding=1)
         time_dim = self.time_embed_dim if self.use_timestep else None
         cond_dim = self.cond_embed_dim if self.use_physics_meta_conditioning else None
         self.t_embedder = TimestepEmbedder(self.time_embed_dim, self.time_embed_freq) if self.use_timestep else None
+        self.in_proj = None
+        self.res1 = None
+        self.up1 = None
+        self.res2 = None
+        self.up2 = None
+        self.res3 = None
+        self.fno_lift = None
+        self.fno_blocks = None
+        self.fno_upsamples = None
+        if self.backbone_type == "cnn":
+            self._build_cnn_backbone(time_dim, cond_dim)
+            self.feature_channels = self.base_channels
+        else:
+            self._build_fno_backbone(time_dim, cond_dim)
+            self.feature_channels = self.hidden_channels
+        self.psi_out = nn.Conv2d(self.feature_channels, self.obs_channels * 2, kernel_size=3, padding=1)
+        self.src_out = nn.Conv2d(self.feature_channels, self.obs_channels, kernel_size=3, padding=1)
+        self._last_residual_aux: Dict[str, float] = {"residual_active_frac": 1.0}
+
+    def _build_cnn_backbone(self, time_dim: Optional[int], cond_dim: Optional[int]):
+        self.in_proj = nn.Conv2d(self.latent_channels, self.base_channels, kernel_size=3, padding=1)
         self.res1 = nn.ModuleList(
             [ResBlock(self.base_channels, self.dropout, time_dim, cond_dim) for _ in range(self.num_res_blocks)]
         )
@@ -184,9 +386,89 @@ class LatentGreen(nn.Module):
         self.res3 = nn.ModuleList(
             [ResBlock(self.base_channels, self.dropout, time_dim, cond_dim) for _ in range(self.num_res_blocks)]
         )
-        self.psi_out = nn.Conv2d(self.base_channels, self.obs_channels * 2, kernel_size=3, padding=1)
-        self.src_out = nn.Conv2d(self.base_channels, self.obs_channels, kernel_size=3, padding=1)
-        self._last_residual_aux: Dict[str, float] = {"residual_active_frac": 1.0}
+
+    def _build_fno_backbone(self, time_dim: Optional[int], cond_dim: Optional[int]):
+        self.fno_lift = nn.Conv2d(self.latent_channels + self.coord_channels, self.hidden_channels, kernel_size=1)
+        block_cls = HybridFNOBlock2d if self.backbone_type == "hybrid_fno" else FNOBlock2d
+        blocks = []
+        for _ in range(self.fno_layers):
+            if self.backbone_type == "hybrid_fno":
+                block = block_cls(
+                    self.hidden_channels,
+                    self.fno_modes_x,
+                    self.fno_modes_y,
+                    self.local_branch_channels,
+                    self.local_branch_depth,
+                    time_dim,
+                    cond_dim,
+                    self.pointwise_skip,
+                    self.norm_type,
+                    self.spectral_dropout,
+                )
+            else:
+                block = block_cls(
+                    self.hidden_channels,
+                    self.fno_modes_x,
+                    self.fno_modes_y,
+                    time_dim,
+                    cond_dim,
+                    self.pointwise_skip,
+                    self.norm_type,
+                    self.spectral_dropout,
+                )
+            blocks.append(block)
+        self.fno_blocks = nn.ModuleList(blocks)
+        self.fno_upsamples = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Upsample(scale_factor=2, mode="bilinear", align_corners=False),
+                    nn.Conv2d(self.hidden_channels, self.hidden_channels, kernel_size=3, padding=1),
+                )
+                for _ in range(self.num_upsamples)
+            ]
+        )
+
+    def _build_coord_grid(self, z: torch.Tensor) -> torch.Tensor:
+        y = torch.linspace(-1.0, 1.0, steps=z.shape[-2], device=z.device, dtype=z.dtype)
+        x = torch.linspace(-1.0, 1.0, steps=z.shape[-1], device=z.device, dtype=z.dtype)
+        yy, xx = torch.meshgrid(y, x, indexing="ij")
+        grid = torch.stack((xx, yy), dim=0).unsqueeze(0)
+        return grid.expand(z.shape[0], -1, -1, -1)
+
+    def _forward_cnn_backbone(
+        self,
+        z: torch.Tensor,
+        t_emb: Optional[torch.Tensor],
+        cond_emb: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        h = self.in_proj(z)
+        for block in self.res1:
+            h = block(h, t_emb, cond_emb)
+        if self.num_upsamples >= 1:
+            h = self.up1(h)
+            for block in self.res2:
+                h = block(h, t_emb, cond_emb)
+        if self.num_upsamples >= 2:
+            h = self.up2(h)
+            for block in self.res3:
+                h = block(h, t_emb, cond_emb)
+        return h
+
+    def _forward_fno_backbone(
+        self,
+        z: torch.Tensor,
+        t_emb: Optional[torch.Tensor],
+        cond_emb: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        x = z
+        if self.use_coord_grid:
+            x = torch.cat([x, self._build_coord_grid(z)], dim=1)
+        h = self.fno_lift(x)
+        for block in self.fno_blocks:
+            h = block(h, t_emb, cond_emb)
+        for upsample in self.fno_upsamples:
+            h = upsample(h)
+        return h
 
     def forward(
         self,
@@ -216,17 +498,10 @@ class LatentGreen(nn.Module):
         if self.use_timestep and t is not None:
             t_emb = self.t_embedder(t)
         cond_emb = self._build_physics_cond_embedding(z, physics_meta)
-        h = self.in_proj(z)
-        for block in self.res1:
-            h = block(h, t_emb, cond_emb)
-        if self.num_upsamples >= 1:
-            h = self.up1(h)
-            for block in self.res2:
-                h = block(h, t_emb, cond_emb)
-        if self.num_upsamples >= 2:
-            h = self.up2(h)
-            for block in self.res3:
-                h = block(h, t_emb, cond_emb)
+        if self.backbone_type == "cnn":
+            h = self._forward_cnn_backbone(z, t_emb, cond_emb)
+        else:
+            h = self._forward_fno_backbone(z, t_emb, cond_emb)
         psi = self.psi_out(h)
         psi_real, psi_imag = psi.chunk(2, dim=1)
         g_pred = self._ldos_from_psi(psi_real, psi_imag)
@@ -330,7 +605,7 @@ class LatentGreen(nn.Module):
 
         if data_loss_domain == "linear_normalized":
             pred_lin_c = g_obs_to_canonical_view(g_pred, self.data_cfg) if self.sublattice_resolved_ldos else g_pred.unsqueeze(2)
-            obs_lin_raw = ldos_linear_from_obs(g_obs, self.data_cfg)
+            obs_lin_raw = ldos_linear_from_obs(g_obs, self.data_cfg).clamp_min(0.0)
             obs_lin_c = obs_lin_raw if self.sublattice_resolved_ldos else obs_lin_raw.unsqueeze(2)
             obs_scale = torch.sqrt((obs_lin_c ** 2).mean(dim=(1, 2, 3, 4), keepdim=True) + 1.0e-12).clamp_min(1.0e-6)
             pred_norm_c = pred_lin_c / obs_scale
@@ -345,7 +620,7 @@ class LatentGreen(nn.Module):
         elif data_loss_domain == "obs_legacy":
             g_pred_for_loss = ldos_obs_from_linear(g_pred, self.data_cfg)
             pred_lin_c = g_obs_to_canonical_view(g_pred, self.data_cfg) if self.sublattice_resolved_ldos else g_pred.unsqueeze(2)
-            obs_lin_raw = ldos_linear_from_obs(g_obs, self.data_cfg)
+            obs_lin_raw = ldos_linear_from_obs(g_obs, self.data_cfg).clamp_min(0.0)
             obs_lin_c = obs_lin_raw if self.sublattice_resolved_ldos else obs_lin_raw.unsqueeze(2)
             if self.sublattice_resolved_ldos:
                 pred_canonical = g_obs_to_canonical_view(g_pred_for_loss, self.data_cfg)
@@ -439,7 +714,7 @@ class LatentGreen(nn.Module):
                 if not self.sublattice_resolved_ldos
                 else flatten_sub_for_energy_ops(g_obs_to_canonical_view(g_pred, self.data_cfg))
             )
-            obs_lin_for_stats = ldos_linear_from_obs(g_obs, self.data_cfg)
+            obs_lin_for_stats = ldos_linear_from_obs(g_obs, self.data_cfg).clamp_min(0.0)
             if self.sublattice_resolved_ldos:
                 obs_lin_for_stats = flatten_sub_for_energy_ops(obs_lin_for_stats)
             if ldos_log_enabled(self.data_cfg):

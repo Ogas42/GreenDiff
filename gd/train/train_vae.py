@@ -1,5 +1,6 @@
 ﻿import os
 import glob
+import sys
 import torch
 import torch.optim as optim
 import torch.distributed as dist
@@ -15,6 +16,22 @@ try:
 except ImportError:
     def tqdm(iterable, **kwargs):
         return iterable
+
+
+def _cfg_bool(value, default=True):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        s = value.strip().lower()
+        if s in {'1', 'true', 'yes', 'y', 'on'}:
+            return True
+        if s in {'0', 'false', 'no', 'n', 'off'}:
+            return False
+    return bool(value)
 
 # Fix for OMP: Error #15: Initializing libomp.dll, but found libiomp5md.dll already initialized.
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
@@ -154,7 +171,11 @@ def train_vae(config: Dict[str, Any]):
     log_every = train_cfg["log_every"]
     grad_clip = train_cfg["grad_clip"]
     
-    pbar = tqdm(total=max_steps, initial=step, desc="Training VAE") if is_main else None
+    show_progress_bar = _cfg_bool(train_cfg.get("show_progress_bar", True), default=True)
+    if not sys.stderr.isatty():
+        show_progress_bar = False
+    pbar = tqdm(total=max_steps, initial=step, desc="Training VAE") if (is_main and show_progress_bar) else None
+    last_saved_step = 0
     
     while step < max_steps:
         if sampler is not None:
@@ -187,11 +208,20 @@ def train_vae(config: Dict[str, Any]):
                 opt.step()
             
             if is_main and step % log_every == 0:
-                pbar.set_postfix({
+                postfix = {
                     "loss": f"{losses['loss'].item():.6f}",
                     "recon": f"{losses['recon_loss'].item():.6f}",
                     "kl": f"{losses['kl_loss'].item():.6f}"
-                })
+                }
+                if pbar is not None:
+                    pbar.set_postfix(postfix)
+                else:
+                    pct = 100.0 * float(step) / float(max(1, max_steps))
+                    print(
+                        f"[vae] step={step}/{max_steps} ({pct:.1f}%) "
+                        f"loss={losses['loss'].item():.6f} recon={losses['recon_loss'].item():.6f} "
+                        f"kl={losses['kl_loss'].item():.6f}"
+                    )
             
             next_step = step + 1
             if is_main and next_step % train_cfg.get("ckpt_every", 2000) == 0:
@@ -199,6 +229,7 @@ def train_vae(config: Dict[str, Any]):
                 ckpt_path = os.path.join(ckpt_dir, f"vae_step_{next_step}.pt")
                 save_target = model_core._orig_mod if hasattr(model_core, "_orig_mod") else model_core
                 torch.save(save_target.state_dict(), ckpt_path)
+                last_saved_step = next_step
 
             if pbar is not None:
                 pbar.update(1)
@@ -207,6 +238,14 @@ def train_vae(config: Dict[str, Any]):
                 break
     if pbar is not None:
         pbar.close()
+    if is_main and step > 0:
+        final_step = int(step)
+        final_ckpt_path = os.path.join(ckpt_dir, f"vae_step_{final_step}.pt")
+        if final_step != last_saved_step and not os.path.exists(final_ckpt_path):
+            os.makedirs(ckpt_dir, exist_ok=True)
+            save_target = model_core._orig_mod if hasattr(model_core, "_orig_mod") else model_core
+            torch.save(save_target.state_dict(), final_ckpt_path)
+            print(f"Saved final VAE checkpoint to {final_ckpt_path}")
     if is_distributed:
         dist.destroy_process_group()
 

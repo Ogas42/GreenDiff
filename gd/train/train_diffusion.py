@@ -16,7 +16,7 @@ from gd.models.diffusion import LatentDiffusion
 from gd.models.latent_green import LatentGreen
 from gd.inference.teacher_sampler import TeacherSampler
 from gd.utils.config_utils import get_latest_checkpoint_dir, load_config
-from gd.utils.ldos_transform import force_linear_ldos_mode, ldos_obs_from_linear
+from gd.utils.ldos_transform import force_linear_ldos_mode, ldos_linear_from_obs, ldos_obs_from_linear
 from gd.utils.loss_align import align_pred, per_energy_affine
 from gd.utils.obs_layout import (
     aggregate_sublattice_ldos,
@@ -94,6 +94,11 @@ def train_diffusion(config: Dict[str, Any]):
     if consistency_loss_weight is None:
         consistency_loss_weight = 0.0
     consistency_loss_weight = float(consistency_loss_weight)
+    phys_supervision_cfg = train_cfg.get("phys_supervision", {})
+    phys_supervision_enabled = bool(phys_supervision_cfg.get("enabled", True))
+    phys_supervision_domain = str(phys_supervision_cfg.get("domain", "linear_normalized")).lower()
+    phys_supervision_norm_rms = bool(phys_supervision_cfg.get("normalize_per_sample_rms", True))
+    consistency_on_norm_linear = bool(phys_supervision_cfg.get("consistency_on_normalized_linear", True))
     precision = config["project"].get("precision", "fp32")
     use_amp = device.type == "cuda" and precision in ("fp16", "bf16")
     amp_dtype = torch.float16 if precision == "fp16" else torch.bfloat16
@@ -417,14 +422,32 @@ def train_diffusion(config: Dict[str, Any]):
 
             def _compute_phys_terms(x0_in):
                 g_pred_phys = lg_core(x0_in, t_zeros)
-                g_pred_phys_for_loss = ldos_obs_from_linear(g_pred_phys, data_cfg)
-                pred_phys = g_obs_to_canonical_view(g_pred_phys_for_loss, data_cfg) if sublattice_resolved else g_pred_phys_for_loss
-                obs_phys = g_obs
+                if phys_supervision_enabled and phys_supervision_domain == "linear_normalized":
+                    pred_lin_c = g_obs_to_canonical_view(g_pred_phys, data_cfg) if sublattice_resolved else g_pred_phys
+                    obs_lin_c = ldos_linear_from_obs(g_obs, data_cfg).clamp_min(0.0)
+                    if phys_supervision_norm_rms:
+                        if sublattice_resolved:
+                            scale = torch.sqrt(
+                                (obs_lin_c ** 2).mean(dim=(1, 2, 3, 4), keepdim=True) + 1.0e-12
+                            ).clamp_min(1.0e-6)
+                        else:
+                            scale = torch.sqrt(
+                                (obs_lin_c ** 2).mean(dim=(1, 2, 3), keepdim=True) + 1.0e-12
+                            ).clamp_min(1.0e-6)
+                        pred_work = pred_lin_c / scale
+                        obs_work = obs_lin_c / scale
+                    else:
+                        pred_work = pred_lin_c
+                        obs_work = obs_lin_c
+                else:
+                    g_pred_phys_for_loss = ldos_obs_from_linear(g_pred_phys, data_cfg)
+                    pred_work = g_obs_to_canonical_view(g_pred_phys_for_loss, data_cfg) if sublattice_resolved else g_pred_phys_for_loss
+                    obs_work = g_obs
                 if use_per_energy_affine:
-                    pred_phys = per_energy_affine(pred_phys, obs_phys)
-                pred_phys, per_energy_loss = align_pred(
-                    pred_phys,
-                    obs_phys,
+                    pred_work = per_energy_affine(pred_work, obs_work)
+                pred_work, per_energy_loss = align_pred(
+                    pred_work,
+                    obs_work,
                     enabled=align_enabled,
                     max_shift=align_max_shift,
                     loss_type=phys_loss_type,
@@ -436,7 +459,7 @@ def train_diffusion(config: Dict[str, Any]):
                     w = _normalize_energy_weights(w).view(1, -1)
                     per_energy_loss = per_energy_loss * w
                 else:
-                    w_dyn = _energy_weights_from_obs(obs_phys)
+                    w_dyn = _energy_weights_from_obs(obs_work)
                     if w_dyn is not None:
                         per_energy_loss = per_energy_loss * w_dyn.view(1, -1)
                 if topk_enabled and topk_k > 0:
@@ -446,8 +469,27 @@ def train_diffusion(config: Dict[str, Any]):
                     phys_loss_per_sample = per_energy_loss.mean(dim=1)
                 psd_per_sample = torch.zeros_like(phys_loss_per_sample)
                 if psd_loss_weight > 0:
-                    psd_per_sample = _psd_loss_per_sample(pred_phys, obs_phys)
-                return phys_loss_per_sample, psd_per_sample, pred_phys
+                    psd_per_sample = _psd_loss_per_sample(pred_work, obs_work)
+                pred_for_consistency = pred_work
+                obs_for_consistency = obs_work
+                if (
+                    not (phys_supervision_enabled and phys_supervision_domain == "linear_normalized")
+                    and consistency_on_norm_linear
+                ):
+                    pred_for_consistency = g_obs_to_canonical_view(g_pred_phys, data_cfg) if sublattice_resolved else g_pred_phys
+                    obs_for_consistency = ldos_linear_from_obs(g_obs, data_cfg).clamp_min(0.0)
+                    if phys_supervision_norm_rms:
+                        if sublattice_resolved:
+                            cons_scale = torch.sqrt(
+                                (obs_for_consistency ** 2).mean(dim=(1, 2, 3, 4), keepdim=True) + 1.0e-12
+                            ).clamp_min(1.0e-6)
+                        else:
+                            cons_scale = torch.sqrt(
+                                (obs_for_consistency ** 2).mean(dim=(1, 2, 3), keepdim=True) + 1.0e-12
+                            ).clamp_min(1.0e-6)
+                        pred_for_consistency = pred_for_consistency / cons_scale
+                        obs_for_consistency = obs_for_consistency / cons_scale
+                return phys_loss_per_sample, psd_per_sample, pred_for_consistency, obs_for_consistency
 
             phys_coeff = 0.0
             phys_loss_val = None
@@ -456,7 +498,7 @@ def train_diffusion(config: Dict[str, Any]):
             phys_sample_weight = alpha_t.view(-1) ** 2
 
             if phys_loss_weight > 0:
-                phys_loss_per_sample, psd_per_sample, pred_for_cons = _compute_phys_terms(x0_pred)
+                phys_loss_per_sample, psd_per_sample, pred_for_cons, obs_for_cons = _compute_phys_terms(x0_pred)
                 with torch.no_grad():
                     raw_phys_loss_val = phys_loss_per_sample.mean().item()
 
@@ -475,7 +517,7 @@ def train_diffusion(config: Dict[str, Any]):
 
                 if consistency_loss_weight > 0:
                     pred_diff = pred_for_cons[:, 1:] - pred_for_cons[:, :-1]
-                    obs_diff = g_obs[:, 1:] - g_obs[:, :-1]
+                    obs_diff = obs_for_cons[:, 1:] - obs_for_cons[:, :-1]
                     const_map = F.mse_loss(pred_diff, obs_diff, reduction='none')
                     reduce_dims = tuple(range(1, const_map.dim()))
                     const_loss_per_sample = const_map.mean(dim=reduce_dims)
@@ -485,10 +527,10 @@ def train_diffusion(config: Dict[str, Any]):
                         raw_const_loss_val = const_loss_per_sample.mean().item()
             elif should_monitor_phys:
                 with torch.no_grad():
-                    phys_loss_per_sample, _psd_monitor, pred_for_cons = _compute_phys_terms(x0_pred.detach())
+                    phys_loss_per_sample, _psd_monitor, pred_for_cons, obs_for_cons = _compute_phys_terms(x0_pred.detach())
                     raw_phys_loss_val = phys_loss_per_sample.mean().item()
                     pred_diff = pred_for_cons[:, 1:] - pred_for_cons[:, :-1]
-                    obs_diff = g_obs[:, 1:] - g_obs[:, :-1]
+                    obs_diff = obs_for_cons[:, 1:] - obs_for_cons[:, :-1]
                     const_map = F.mse_loss(pred_diff, obs_diff, reduction='none')
                     reduce_dims = tuple(range(1, const_map.dim()))
                     const_loss_per_sample = const_map.mean(dim=reduce_dims)
@@ -571,7 +613,13 @@ def train_diffusion(config: Dict[str, Any]):
                 }
                 if pbar is not None:
                     pbar.set_postfix(postfix)
-                print(f"[stats] step={step} bs={z.shape[0]} loss={loss.item():.6f} lr={current_lr:.2e} x0_raw={x0_raw_str} x0_w={x0_w_str} phys={phys_str} const={const_step_str} phys_w={phys_coeff_str}")
+                step_disp = int(step)
+                pct = 100.0 * float(step_disp) / float(max(1, max_steps))
+                print(
+                    f"[stats] step={step_disp}/{max_steps} ({pct:.1f}%) bs={z.shape[0]} "
+                    f"loss={loss.item():.6f} lr={current_lr:.2e} "
+                    f"x0_raw={x0_raw_str} x0_w={x0_w_str} phys={phys_str} const={const_step_str} phys_w={phys_coeff_str}"
+                )
                 print(f"[avg] loss={loss_avg:.6f} x0_raw={x0_avg_str} phys={phys_avg_str} const={const_avg_str} phys_w={phys_coeff_avg_str}")
                 print(f"[stats] z={z_mean:.4f}/{z_std:.4f} snr={snr_mean:.2f}/{snr_min:.2f}/{snr_max:.2f} w={weight_mean:.3f}")
 

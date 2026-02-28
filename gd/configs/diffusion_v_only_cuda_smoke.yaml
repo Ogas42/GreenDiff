@@ -16,6 +16,7 @@ data:
   sublattice_resolved_ldos: true
   target_representation: ldos_ab
   cache_require_physics_meta: true
+  enforce_nonnegative_ldos: true
   ldos_canonical_layout: k_s_h_w
   ldos_model_layout: flat_channels
   energies:
@@ -164,7 +165,7 @@ vae:
     grad_clip: 1.0
     max_steps: 500
     log_every: 25
-    show_progress_bar: false
+    show_progress_bar: true
     ckpt_every: 250
     val_every: 250
 
@@ -186,9 +187,9 @@ latent_green:
     time_embed_freq: 128
     use_fft_loss: true
     fft_loss_weight: 0.35
-    stats_loss_weight: 0.02
+    stats_loss_weight: 0.06
     linear_scale_loss_weight: 0.0
-    multiscale_loss_weight: 0.05
+    multiscale_loss_weight: 0.08
     multiscale_scales: [2, 4]
     loss_type: huber
     huber_beta: 0.1
@@ -202,13 +203,13 @@ latent_green:
     aux_warmup_steps: 100
     peak_control:
       enabled: true
-      log_aux_weight: 0.10
+      log_aux_weight: 0.15
       log_aux_huber_beta: 0.1
       log_aux_scale: p95_obs_per_sample
-      topk_loss_weight: 0.20
+      topk_loss_weight: 0.30
       topk_frac: 0.005
       topk_huber_beta: 0.1
-      peak_ratio_penalty_weight: 0.05
+      peak_ratio_penalty_weight: 0.20
       peak_ratio_cap: 4.0
     residual_loss_weight: 1.0
     physics_losses:
@@ -232,7 +233,7 @@ latent_green:
     grad_clip: 1.0
     max_steps: 1000
     log_every: 25
-    show_progress_bar: false
+    show_progress_bar: true
     ckpt_every: 250
     debug_fixed_batch: false
     surrogate_check:
@@ -277,7 +278,7 @@ diffusion:
     max_steps: 2000
     log_every: 50
     log_smooth_window: 5
-    show_progress_bar: false
+    show_progress_bar: true
     ckpt_every: 500
     val_every: 500
     vis_fixed_n: 2

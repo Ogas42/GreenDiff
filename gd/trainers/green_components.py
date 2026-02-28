@@ -86,7 +86,7 @@ def compute_rel_for_logging(
             log_cosh_eps=log_cosh_eps,
         )
         rel_l2 = torch.norm(g_pred_log - g_obs_log) / torch.norm(g_obs_log).clamp_min(1.0e-6)
-        g_obs_lin = ldos_linear_from_obs(g_obs_log, data_cfg)
+        g_obs_lin = ldos_linear_from_obs(g_obs_log, data_cfg).clamp_min(0.0)
         aux.update(
             {
                 "pred_min": g_pred.min().item(),
@@ -108,12 +108,14 @@ def compute_rel_for_logging(
             g_pred_obs = flatten_sub_for_energy_ops(g_obs_to_canonical_view(ldos_obs_from_linear(g_pred, data_cfg), data_cfg))
             g_obs_obs = flatten_sub_for_energy_ops(g_obs)
             g_pred_lin_stats = flatten_sub_for_energy_ops(g_obs_to_canonical_view(g_pred, data_cfg))
-            g_obs_lin = flatten_sub_for_energy_ops(g_obs_to_canonical_view(ldos_linear_from_obs(g_obs, data_cfg), data_cfg))
+            g_obs_lin = flatten_sub_for_energy_ops(
+                g_obs_to_canonical_view(ldos_linear_from_obs(g_obs, data_cfg).clamp_min(0.0), data_cfg)
+            )
         else:
             g_pred_obs = ldos_obs_from_linear(g_pred, data_cfg)
             g_obs_obs = g_obs
             g_pred_lin_stats = g_pred
-            g_obs_lin = ldos_linear_from_obs(g_obs, data_cfg)
+            g_obs_lin = ldos_linear_from_obs(g_obs, data_cfg).clamp_min(0.0)
         if use_per_energy_affine:
             g_pred_obs = per_energy_affine(g_pred_obs, g_obs_obs)
         g_pred_obs, _ = align_pred(
@@ -130,8 +132,10 @@ def compute_rel_for_logging(
             {
                 "pred_min": g_pred_obs.min().item(),
                 "pred_max": g_pred_obs.max().item(),
+                "pred_p99": torch.quantile(g_pred_obs.reshape(g_pred_obs.shape[0], -1), 0.99, dim=1).mean().item(),
                 "obs_min": g_obs_obs.min().item(),
                 "obs_max": g_obs_obs.max().item(),
+                "obs_p99": torch.quantile(g_obs_obs.reshape(g_obs_obs.shape[0], -1), 0.99, dim=1).mean().item(),
                 "pred_lin_mean": g_pred_lin_stats.mean().item(),
                 "pred_lin_std": g_pred_lin_stats.std().item(),
                 "obs_lin_mean": g_obs_lin.mean().item(),
@@ -311,6 +315,7 @@ def log_green_train_status(
 
     log_every = int(train_cfg["log_every"])
     if step % (log_every * 5) == 0:
+        tail_msg = ""
         if aux_log.get("log_enabled", False):
             msg = (
                 f"Step {step}: "
@@ -333,14 +338,21 @@ def log_green_train_status(
                 f"Step {step}: Pred Lin mean/std [{aux_log.get('pred_lin_mean', 0):.3f}, {aux_log.get('pred_lin_std', 0):.3f}] | "
                 f"Obs Lin mean/std [{aux_log.get('obs_lin_mean', 0):.3f}, {aux_log.get('obs_lin_std', 0):.3f}]"
             )
+            tail_msg = (
+                f"Step {step}: Pred/Obs p99 [{aux_log.get('pred_p99', 0):.3f}, {aux_log.get('obs_p99', 0):.3f}]"
+            )
         if pbar is not None:
             pbar.write(summary)
             pbar.write(msg)
             pbar.write(stats_msg)
+            if tail_msg:
+                pbar.write(tail_msg)
         else:
             print(summary)
             print(msg)
             print(stats_msg)
+            if tail_msg:
+                print(tail_msg)
     elif pbar is not None:
         pbar.write(summary)
     else:

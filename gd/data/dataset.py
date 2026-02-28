@@ -69,6 +69,9 @@ class GFDataset(Dataset):
                 self.ldos_cfg.get("enabled", False) and self.ldos_cfg.get("apply_to_cache", True),
             )
         )
+        # Physical LDOS should be non-negative. Keep this enabled by default and
+        # allow opt-out for debugging legacy caches.
+        self.enforce_nonnegative_ldos = bool(self.data_cfg.get("enforce_nonnegative_ldos", True))
         self.energies = self._build_energies()
         
         # Check for cache
@@ -259,6 +262,7 @@ class GFDataset(Dataset):
                 if not cache_scaled and self._should_transform_cache(sample["g_obs"]):
                     sample = dict(sample)
                     sample["g_obs"] = self._transform_ldos(sample["g_obs"])
+            sample = self._postprocess_cached_sample(sample)
             sample = self._maybe_attach_cached_physics_meta(sample)
             sample = self._maybe_attach_cached_defect_meta(sample)
             return sample
@@ -269,6 +273,7 @@ class GFDataset(Dataset):
                 if not cache_scaled and self._should_transform_cache(sample["g_obs"]):
                     sample = dict(sample)
                     sample["g_obs"] = self._transform_ldos(sample["g_obs"])
+            sample = self._postprocess_cached_sample(sample)
             sample = self._maybe_attach_cached_physics_meta(sample)
             sample = self._maybe_attach_cached_defect_meta(sample)
             return sample
@@ -282,9 +287,14 @@ class GFDataset(Dataset):
             if lattice_type_cfg in ("graphene", "honeycomb", "random"):
                 defect_meta = self.structural_sampler.sample_graphene(H, W, seed=self.base_seed + idx)
         g_ideal = self.kpm.compute_ldos(V, self.energies, defect_meta=defect_meta)
+        g_ideal = self._clamp_nonnegative_ldos(g_ideal)
         g_obs = self.degradation(g_ideal)
+        g_obs = self._clamp_nonnegative_ldos(g_obs)
         if self.ldos_cfg.get("enabled", False):
             g_obs = self._transform_ldos(g_obs)
+            # In linear observation mode (default), keep transformed cache non-negative too.
+            if not self._obs_log_transform_enabled():
+                g_obs = self._clamp_nonnegative_ldos(g_obs)
         sample = {"V": V, "g_obs": g_obs}
         if self.attach_defect_meta and defect_meta is not None:
             sample["defect_meta"] = defect_meta
@@ -324,6 +334,38 @@ class GFDataset(Dataset):
         if scale is not None and float(scale) != 1.0:
             x = x * float(scale)
         return x
+
+    def _obs_log_transform_enabled(self) -> bool:
+        if not bool(self.ldos_cfg.get("enabled", False)):
+            return False
+        log_cfg = self.ldos_cfg.get("log", {})
+        return bool(isinstance(log_cfg, dict) and log_cfg.get("enabled", False))
+
+    def _clamp_nonnegative_ldos(self, x: torch.Tensor) -> torch.Tensor:
+        if not self.enforce_nonnegative_ldos:
+            return x
+        if not isinstance(x, torch.Tensor) or not torch.is_floating_point(x):
+            return x
+        if x.numel() == 0:
+            return x
+        if float(torch.min(x).item()) >= 0.0:
+            return x
+        return x.clamp_min(0.0)
+
+    def _postprocess_cached_sample(self, sample: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
+        if not self.enforce_nonnegative_ldos:
+            return sample
+        if not isinstance(sample, dict) or "g_obs" not in sample:
+            return sample
+        if self._obs_log_transform_enabled():
+            return sample
+        g_obs = sample["g_obs"]
+        g_fixed = self._clamp_nonnegative_ldos(g_obs)
+        if g_fixed is g_obs:
+            return sample
+        out = dict(sample)
+        out["g_obs"] = g_fixed
+        return out
 
     def _maybe_attach_cached_physics_meta(self, sample: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
         if not self.attach_physics_meta:

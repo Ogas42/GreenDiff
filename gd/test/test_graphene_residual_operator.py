@@ -28,6 +28,7 @@ def _small_cfg():
     cfg["physics"]["hamiltonian"]["t"] = 2.7
     cfg["vae"]["latent_downsample"] = 2
     cfg["vae"]["latent_channels"] = 4
+    cfg["latent_green"]["model"]["backbone"] = "cnn"
     cfg["latent_green"]["model"]["base_channels"] = 16
     cfg["latent_green"]["model"]["num_res_blocks"] = 1
     cfg["latent_green"]["model"]["use_fft_loss"] = False
