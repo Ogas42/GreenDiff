@@ -1,0 +1,33 @@
+suite:
+  name: global_ablation_server
+  description: "Server-ready one-shot global ablation batch for GreenDiff."
+  base_config: gd/configs/a6000_48g_12c_32g.yaml
+
+  # Default execution mode for the wrapper script.
+  # Supported: print | train | eval | train_then_eval
+  stage: train_then_eval
+
+  # Predefined suites exposed by gd.test.run_global_ablation
+  suites:
+    - proxy_backbone
+    - proxy_losses
+    - teacher_inference
+    - teacher_budget
+
+  # Evaluation arguments forwarded to each suite run.
+  eval:
+    num_batches: 20
+    batch_size: 4
+
+  # Batch-level output root. The wrapper will create:
+  # <output_root>/<suite.name>/<timestamp>/
+  output_root: gd/runs/ablation_batches
+
+  # If true, append a timestamp under the suite batch root.
+  include_timestamp: true
+
+  # Stop the whole batch immediately if one suite fails.
+  stop_on_error: true
+
+  # Whether to print each delegated command before execution.
+  verbose: true

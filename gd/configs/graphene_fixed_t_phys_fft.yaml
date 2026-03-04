@@ -1,8 +1,8 @@
 ﻿project:
   name: GreenDiff
   seed: 42
-  device: cpu
-  precision: fp32
+  device: gpu
+  precision: bf16
   compile: false
   cudnn_benchmark: false
 paths:
@@ -39,8 +39,8 @@ data:
     scale: 100000.0
     cache_scaled: true
   return_physics_meta: false
-  num_samples_total: 50000
-  cache_shard_size: 256
+  num_samples_total: 100000
+  cache_shard_size: 512
   num_workers: 12
   shard_workers: 8
   pin_memory: true
@@ -144,8 +144,7 @@ vae:
     weight_decay: 0.0
     grad_clip: 1.0
     max_steps: 50000
-    log_every: 100
-    show_progress_bar: false
+    log_every: 1000
     ckpt_every: 5000
     val_every: 5000
 
@@ -180,17 +179,7 @@ latent_green:
       enabled: false
       max_shift: 0
     log_cosh_eps: 1.0e-6
-    aux_warmup_steps: 5000
-    peak_control:
-      enabled: true
-      log_aux_weight: 0.10
-      log_aux_huber_beta: 0.1
-      log_aux_scale: p95_obs_per_sample
-      topk_loss_weight: 0.20
-      topk_frac: 0.005
-      topk_huber_beta: 0.1
-      peak_ratio_penalty_weight: 0.05
-      peak_ratio_cap: 4.0
+    aux_warmup_steps: 10000
     residual_loss_weight: 1.0
     physics_losses:
       data_weight: 1.0
@@ -211,10 +200,9 @@ latent_green:
     lr: 1.0e-4
     weight_decay: 0.0
     grad_clip: 1.0
-    max_steps: 100000
-    log_every: 100
-    show_progress_bar: false
-    ckpt_every: 10
+    max_steps: 200000
+    log_every: 500
+    ckpt_every: 4000
     debug_fixed_batch: false
     surrogate_check:
       enabled: false
@@ -255,16 +243,13 @@ diffusion:
     lr: 1.0e-4
     weight_decay: 0.0
     grad_clip: 1.0
-    max_steps: 200000
-    log_every: 500
+    max_steps: 300000
+    log_every: 1000
     log_smooth_window: 5
-    show_progress_bar: false
     ckpt_every: 5000
     val_every: 5000
     vis_fixed_n: 2
     prediction_type: eps
-    inverse_target: v_only
-    allow_unclosed_inverse: true
     x0_loss_weight: 0.10
     phys_loss_weight: 0.05
     phys_loss_type: mse
@@ -285,21 +270,6 @@ diffusion:
     energy_weight_eps: 1.0e-6
     energy_weight_power: 1.0
     consistency_loss_weight: 0.02
-    phys_supervision:
-      enabled: true
-      domain: linear_normalized
-      monitor_when_disabled: true
-      normalize_per_sample_rms: true
-      consistency_on_normalized_linear: true
-    phys_gate:
-      enabled: true
-      mode: require_green_metrics
-      allow_override: false
-      green_metrics_path: auto_latest
-      rel_l2_max: 0.60
-      peak_ratio_max: 5.0
-      mean_ratio_min: 0.70
-      mean_ratio_max: 1.30
     topk_phys:
       enabled: false
       k: 0
